@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
-from app.gen202 import Gen202Client, Gen202Error
+from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 app = FastAPI(title="MAXAI GEN202 bridge", version="0.1.0")
