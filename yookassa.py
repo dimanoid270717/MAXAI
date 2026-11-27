@@ -92,6 +92,119 @@ async def fetch_yookassa_payment(payment_id: str) -> dict:
         ) from exc
 
 
+async def fetch_yookassa_refund(refund_id: str) -> dict:
+    """Получает актуальный возврат напрямую из API ЮKassa."""
+    shop_id, secret = _credentials()
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.get(
+                f"{YOOKASSA_API}/refunds/{refund_id}",
+                auth=(shop_id, secret),
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось проверить возврат в ЮKassa",
+        ) from exc
+
+
+def mark_payment_cancelled(database_url: str, payment: dict) -> bool:
+    """Помечает заказ отменённым только по подтверждённому статусу API."""
+    if payment.get("status") != "canceled":
+        return False
+    payment_id = str(payment.get("id") or "")
+    if not payment_id:
+        return False
+    with psycopg.connect(database_url, row_factory=dict_row) as conn:
+        row = conn.execute(
+            """UPDATE purchase_orders
+               SET status='cancelled', updated_at=NOW()
+               WHERE provider_payment_id=%s AND status='awaiting_payment'
+               RETURNING id""",
+            (payment_id,),
+        ).fetchone()
+        return bool(row)
+
+
+def process_yookassa_refund(database_url: str, refund: dict) -> str:
+    """Обрабатывает полный возврат. Частичный/нехватка баланса требуют ручной проверки."""
+    if refund.get("status") != "succeeded":
+        return "ignored"
+    refund_id = str(refund.get("id") or "")
+    payment_id = str(refund.get("payment_id") or "")
+    if not refund_id or not payment_id:
+        return "ignored"
+    try:
+        refund_amount = Decimal(str((refund.get("amount") or {}).get("value")))
+    except (InvalidOperation, TypeError):
+        return "ignored"
+    if (refund.get("amount") or {}).get("currency") != "RUB":
+        return "ignored"
+
+    with psycopg.connect(database_url, row_factory=dict_row) as conn:
+        order = conn.execute(
+            """SELECT id, max_user_id, package_credits, amount_rub,
+                      status, provider_payment_id
+               FROM purchase_orders WHERE provider_payment_id=%s FOR UPDATE""",
+            (payment_id,),
+        ).fetchone()
+        if not order or order["status"] != "paid":
+            return "ignored"
+        if order.get("provider_refund_id") == refund_id or order["status"] == "refunded":
+            return "duplicate"
+        prior = conn.execute(
+            "SELECT id FROM credit_transactions WHERE idempotency_key=%s",
+            (f"yookassa-refund:{refund_id}",),
+        ).fetchone()
+        if prior:
+            return "duplicate"
+
+        full_amount = Decimal(order["amount_rub"]).quantize(Decimal("0.01"))
+        if refund_amount != full_amount:
+            conn.execute(
+                "UPDATE purchase_orders SET status='refund_review', provider_refund_id=%s, updated_at=NOW() WHERE id=%s",
+                (refund_id, int(order["id"])),
+            )
+            return "review"
+
+        user = conn.execute(
+            "SELECT balance FROM users WHERE max_user_id=%s FOR UPDATE",
+            (int(order["max_user_id"]),),
+        ).fetchone()
+        credits = int(order["package_credits"])
+        if not user or int(user["balance"]) < credits:
+            conn.execute(
+                "UPDATE purchase_orders SET status='refund_review', provider_refund_id=%s, updated_at=NOW() WHERE id=%s",
+                (refund_id, int(order["id"])),
+            )
+            return "review"
+
+        conn.execute(
+            "UPDATE users SET balance=balance-%s, last_seen_at=NOW() WHERE max_user_id=%s",
+            (credits, int(order["max_user_id"])),
+        )
+        inserted = conn.execute(
+            """INSERT INTO credit_transactions
+                   (max_user_id, amount, reason, idempotency_key)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+               DO NOTHING RETURNING id""",
+            (int(order["max_user_id"]), -credits,
+             f"Возврат ЮKassa, заказ по платежу {payment_id}",
+             f"yookassa-refund:{refund_id}"),
+        ).fetchone()
+        if not inserted:
+            # На случай гонки: откатить изменение баланса текущей транзакции.
+            raise RuntimeError("Повторный возврат: операция уже зарегистрирована")
+        conn.execute(
+            "UPDATE purchase_orders SET status='refunded', provider_refund_id=%s, updated_at=NOW() WHERE id=%s",
+            (refund_id, int(order["id"])),
+        )
+        return "refunded"
+
+
 def save_payment_id(database_url: str, order_code: str, payment_id: str) -> None:
     with psycopg.connect(database_url, row_factory=dict_row) as conn:
         row = conn.execute(
@@ -156,22 +269,14 @@ def credit_paid_order(database_url: str, payment: dict) -> bool:
         if order["status"] != "awaiting_payment":
             return False
 
-        conn.execute(
-            """
-            UPDATE users
-            SET balance = balance + %s,
-                last_seen_at = NOW()
-            WHERE max_user_id = %s
-            """,
-            (int(order["package_credits"]), int(order["max_user_id"])),
-        )
-        conn.execute(
+        inserted = conn.execute(
             """
             INSERT INTO credit_transactions
                 (max_user_id, amount, reason, idempotency_key)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
             DO NOTHING
+            RETURNING id
             """,
             (
                 int(order["max_user_id"]),
@@ -179,7 +284,21 @@ def credit_paid_order(database_url: str, payment: dict) -> bool:
                 f"Оплата ЮKassa, заказ {order_code}",
                 f"yookassa:{payment_id}",
             ),
-        )
+        ).fetchone()
+        if not inserted:
+            return False
+        updated = conn.execute(
+            """
+            UPDATE users
+            SET balance = balance + %s,
+                last_seen_at = NOW()
+            WHERE max_user_id = %s
+            RETURNING max_user_id
+            """,
+            (int(order["package_credits"]), int(order["max_user_id"])),
+        ).fetchone()
+        if not updated:
+            raise RuntimeError("Пользователь для начисления не найден")
         conn.execute(
             """
             UPDATE purchase_orders
