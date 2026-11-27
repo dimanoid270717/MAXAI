@@ -224,6 +224,9 @@ def initialize_database():
         conn.execute("""
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ
         """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS submission_started_at TIMESTAMPTZ
+        """)
     _db_initialized = True
 
 
@@ -597,7 +600,8 @@ def debit_generation(user_id: int, generation_id: int) -> tuple[bool, str]:
         conn.execute("UPDATE users SET balance=balance-%s, last_seen_at=NOW() WHERE max_user_id=%s",
                      (price, user_id))
         conn.execute("""
-            UPDATE generation_history SET status='starting', last_error=NULL
+            UPDATE generation_history
+            SET status='starting', last_error=NULL, submission_started_at=NOW()
             WHERE id=%s AND max_user_id=%s
         """, (generation_id, user_id))
     return True, "ok"
@@ -793,6 +797,17 @@ async def generation_poll_worker():
     while True:
         try:
             initialize_database()
+            # Если процесс умер после списания, но до сохранения taskId,
+            # не повторяем платный запрос: переводим запись в ручную сверку.
+            with db_connect() as conn:
+                conn.execute("""
+                    UPDATE generation_history
+                    SET status='submission_unknown',
+                        last_error='Процесс завершился до сохранения taskId; требуется сверка с GEN202',
+                        last_checked_at=NOW()
+                    WHERE status='starting'
+                      AND submission_started_at < NOW() - INTERVAL '2 minutes'
+                """)
             with db_connect() as conn:
                 rows = conn.execute("""
                     WITH due AS (
