@@ -80,7 +80,7 @@ class TestGenerationSafety(unittest.IsolatedAsyncioTestCase):
         conn.__enter__.return_value = conn
         conn.__exit__.return_value = False
         conn.execute.return_value.fetchall.return_value = pending
-        with patch.object(main, "db_connect", return_value=conn), \\
+        with patch.object(main, "db_connect", return_value=conn), \
              patch.object(main, "send_max", new=AsyncMock()) as send:
             await main.deliver_generation_notifications()
         send.assert_awaited_once()
@@ -96,7 +96,7 @@ class TestGenerationSafety(unittest.IsolatedAsyncioTestCase):
         conn.__enter__.return_value = conn
         conn.__exit__.return_value = False
         conn.execute.return_value.fetchall.return_value = pending
-        with patch.object(main, "db_connect", return_value=conn), \\
+        with patch.object(main, "db_connect", return_value=conn), \
              patch.object(main, "send_max", new=AsyncMock(side_effect=RuntimeError("MAX unavailable"))):
             with self.assertRaisesRegex(RuntimeError, "MAX unavailable"):
                 await main.deliver_generation_notifications()
