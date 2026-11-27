@@ -1,0 +1,82 @@
+
+name: Apply NEUROPIX patch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.ref == 'refs/heads/neuropix-2.0'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: neuropix-2.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Preflight source checks
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          main = Path("main.py").read_text(encoding="utf-8")
+          yk = Path("yookassa.py").read_text(encoding="utf-8")
+
+          checks = [
+              ('@app.get("/tasks/{task_id}")' in main,
+               "Task endpoint not found"),
+              ('@app.get("/payment/return")' in main,
+               "Payment return endpoint not found"),
+              (main.find('@app.get("/tasks/{task_id}")') <
+               main.find('@app.get("/payment/return")'),
+               "Unexpected route order"),
+              ('headers={"Idempotence-Key": str(uuid.uuid4())}' in yk,
+               "Payment idempotency anchor not found"),
+              (yk.count("async def fetch_yookassa_refund(") == 2,
+               "Expected exactly two refund function definitions"),
+          ]
+
+          for ok, message in checks:
+              if not ok:
+                  raise SystemExit("STOP: " + message)
+
+          print("Source checks passed.")
+          PY
+
+      - name: Fix test location and run tests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("test_patcher.py")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace(
+              'Path(__file__).resolve().parents[1] / "apply_neuropix_2.py"',
+              'Path(__file__).resolve().parent / "apply_neuropix_2.py"'
+          )
+          p.write_text(s, encoding="utf-8")
+          PY
+          python -m unittest -v test_patcher.py
+
+      - name: Apply patch
+        run: python apply_neuropix_2.py
+
+      - name: Compile Python files
+        run: python -m py_compile main.py yookassa.py gen202.py
+
+      - name: Commit patched files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.py yookassa.py .env.example test_patcher.py
+          git diff --cached --check
+          git commit -m "Apply NEUROPIX safety and payment patch"
+          git push origin HEAD:neuropix-2.0
