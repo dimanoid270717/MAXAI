@@ -14,7 +14,7 @@ from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.9.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.9.1")
 
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
@@ -992,9 +992,9 @@ async def max_webhook(
             int(user_id), credits, amount_rub
         )
         answer = (
-            f"Заявка на покупку создана.\\n"
-            f"Номер заявки: {order_code}\\n"
-            f"Пакет: {credits} кредитов за {amount_rub} ₽.\\n\\n"
+            f"Заявка на покупку создана.\n"
+            f"Номер заявки: {order_code}\n"
+            f"Пакет: {credits} кредитов за {amount_rub} ₽.\n\n"
             "Это не оплата: платёжная система ещё не подключена. "
             "Деньги не списаны, кредиты не начислены."
         )
@@ -1018,7 +1018,7 @@ async def max_webhook(
                     f"• {order['order_code']} — {order['package_credits']} кредитов, "
                     f"{order['amount_rub']} ₽; {status}; {created}"
                 )
-            answer = "ТВОИ ЗАЯВКИ НА ПОКУПКУ\\n\\n" + "\\n".join(lines)
+            answer = "ТВОИ ЗАЯВКИ НА ПОКУПКУ\n\n" + "\n".join(lines)
         else:
             answer = "Заявок на покупку пока нет."
         show_menu, keyboard = True, None
