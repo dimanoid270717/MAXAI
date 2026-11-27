@@ -1,4 +1,5 @@
 import os
+import secrets
 import ssl
 from datetime import datetime, timezone
 
@@ -13,7 +14,7 @@ from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.8.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.9.0")
 
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
@@ -108,6 +109,24 @@ def initialize_database() -> None:
                 credit_transactions_idempotency_key_unique
                 ON credit_transactions (idempotency_key)
                 WHERE idempotency_key IS NOT NULL
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS purchase_orders (
+                    id BIGSERIAL PRIMARY KEY,
+                    order_code TEXT NOT NULL UNIQUE,
+                    max_user_id BIGINT NOT NULL REFERENCES users(max_user_id),
+                    package_credits INTEGER NOT NULL CHECK (package_credits > 0),
+                    amount_rub INTEGER NOT NULL CHECK (amount_rub > 0),
+                    status TEXT NOT NULL DEFAULT 'awaiting_payment',
+                    payment_provider TEXT,
+                    provider_payment_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS purchase_orders_user_created_idx
+                ON purchase_orders (max_user_id, created_at DESC)
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS generation_history (
@@ -278,6 +297,63 @@ def apply_credit_change(
         raise HTTPException(
             status_code=503,
             detail=f"Could not update credit ledger: {type(exc).__name__}",
+        ) from exc
+
+
+def create_pending_purchase_order(
+    user_id: int,
+    credits: int,
+    amount_rub: int,
+) -> str:
+    """Записывает выбор пакета; не принимает оплату и не начисляет кредиты."""
+    if credits not in (100, 300, 500, 1000) or amount_rub != credits:
+        raise ValueError("Unknown credit package")
+    initialize_database()
+    order_code = secrets.token_hex(5).upper()
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO users (max_user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (user_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO purchase_orders
+                    (order_code, max_user_id, package_credits, amount_rub, status)
+                VALUES (%s, %s, %s, %s, 'awaiting_payment')
+                """,
+                (order_code, user_id, credits, amount_rub),
+            )
+        return order_code
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not create purchase order: {type(exc).__name__}",
+        ) from exc
+
+
+def get_recent_purchase_orders(user_id: int, limit: int = 5) -> list[dict]:
+    initialize_database()
+    try:
+        with db_connect() as conn:
+            return conn.execute(
+                """
+                SELECT order_code, package_credits, amount_rub, status, created_at
+                FROM purchase_orders
+                WHERE max_user_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            ).fetchall()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not read purchase orders: {type(exc).__name__}",
         ) from exc
 
 
@@ -593,8 +669,8 @@ def main_keyboard() -> list[list[dict]]:
         ["Создать фото", "Создать видео"],
         ["Каталог эффектов"],
         ["Тарифы", "Мой баланс"],
-        ["Купить кредиты", "История"],
-        ["Поддержка"],
+        ["Купить кредиты", "Мои заказы"],
+        ["История", "Поддержка"],
     ])
 
 
@@ -875,26 +951,26 @@ async def max_webhook(
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command in ("тарифы", "цены", "стоимость"):
         answer = (
-            "ТАРИФЫ NEUROPIX\\n\\n"
-            "ФОТОГРАФИИ\\n"
-            "• 1K — 15 кредитов\\n"
-            "• 2K — 20 кредитов\\n"
-            "• 4K — 35 кредитов\\n\\n"
-            "ВИДЕО — 5 СЕКУНД\\n"
-            "• 480p — 149 кредитов\\n"
-            "• 720p — 299 кредитов\\n"
-            "• 1080p — временно недоступно\\n\\n"
+            "ТАРИФЫ NEUROPIX\n\n"
+            "ФОТОГРАФИИ\n"
+            "• 1K — 15 кредитов\n"
+            "• 2K — 20 кредитов\n"
+            "• 4K — 35 кредитов\n\n"
+            "ВИДЕО — 5 СЕКУНД\n"
+            "• 480p — 149 кредитов\n"
+            "• 720p — 299 кредитов\n"
+            "• 1080p — временно недоступно\n\n"
             "1 кредит = 1 рубль. Цены предварительные. "
             "Оплата и запуск генерации пока отключены."
         )
         show_menu, keyboard = True, None
     elif command == "купить кредиты":
         answer = (
-            "ВЫБЕРИ ПАКЕТ КРЕДИТОВ\\n\\n"
-            "• 100 кредитов — 100 ₽\\n"
-            "• 300 кредитов — 300 ₽\\n"
-            "• 500 кредитов — 500 ₽\\n"
-            "• 1 000 кредитов — 1 000 ₽\\n\\n"
+            "ВЫБЕРИ ПАКЕТ КРЕДИТОВ\n\n"
+            "• 100 кредитов — 100 ₽\n"
+            "• 300 кредитов — 300 ₽\n"
+            "• 500 кредитов — 500 ₽\n"
+            "• 1 000 кредитов — 1 000 ₽\n\n"
             "Оплата пока не подключена. Выбор пакета ничего не покупает "
             "и не списывает деньги."
         )
@@ -905,12 +981,47 @@ async def max_webhook(
         "500 кредитов — 500 ₽",
         "1 000 кредитов — 1 000 ₽",
     ):
-        answer = (
-            f"Выбран пакет: {message_text}.\\n"
-            "Это пока предварительный выбор. Платёжная система ещё не подключена: "
-            "деньги не списаны, кредиты не начислены."
+        package_map = {
+            "100 кредитов — 100 ₽": (100, 100),
+            "300 кредитов — 300 ₽": (300, 300),
+            "500 кредитов — 500 ₽": (500, 500),
+            "1 000 кредитов — 1 000 ₽": (1000, 1000),
+        }
+        credits, amount_rub = package_map[command]
+        order_code = create_pending_purchase_order(
+            int(user_id), credits, amount_rub
         )
-        show_menu, keyboard = False, credit_packages_keyboard()
+        answer = (
+            f"Заявка на покупку создана.\\n"
+            f"Номер заявки: {order_code}\\n"
+            f"Пакет: {credits} кредитов за {amount_rub} ₽.\\n\\n"
+            "Это не оплата: платёжная система ещё не подключена. "
+            "Деньги не списаны, кредиты не начислены."
+        )
+        show_menu, keyboard = True, None
+    elif command == "мои заказы":
+        orders = get_recent_purchase_orders(int(user_id), limit=5)
+        if orders:
+            status_names = {
+                "awaiting_payment": "ожидает подключения оплаты",
+                "paid": "оплачен",
+                "cancelled": "отменён",
+                "failed": "ошибка оплаты",
+            }
+            lines = []
+            for order in orders:
+                created = order["created_at"].astimezone(timezone.utc).strftime(
+                    "%d.%m.%Y %H:%M UTC"
+                )
+                status = status_names.get(order["status"], order["status"])
+                lines.append(
+                    f"• {order['order_code']} — {order['package_credits']} кредитов, "
+                    f"{order['amount_rub']} ₽; {status}; {created}"
+                )
+            answer = "ТВОИ ЗАЯВКИ НА ПОКУПКУ\\n\\n" + "\\n".join(lines)
+        else:
+            answer = "Заявок на покупку пока нет."
+        show_menu, keyboard = True, None
     elif command == "мой баланс":
         balance = get_user_balance(int(user_id))
         activity = get_credit_activity(int(user_id), limit=5)
@@ -922,12 +1033,12 @@ async def max_webhook(
                 activity_lines.append(
                     f"• {sign}{item['amount']} — {item['reason']} ({when})"
                 )
-            activity_text = "\\nПоследние операции:\\n" + "\\n".join(activity_lines)
+            activity_text = "\nПоследние операции:\n" + "\n".join(activity_lines)
         else:
-            activity_text = "\\nОпераций пока нет."
+            activity_text = "\nОпераций пока нет."
         answer = (
             f"Твой баланс: {balance} кредитов."
-            f"{activity_text}\\n\\n"
+            f"{activity_text}\n\n"
             "Покупка и начисление кредитов пока не включены."
         )
         show_menu, keyboard = True, None
@@ -939,7 +1050,7 @@ async def max_webhook(
             lines = []
             for item in history:
                 kind = "фото" if item["generation_type"] == "image" else "видео"
-                prompt = (item.get("prompt") or "").strip().replace("\\n", " ")
+                prompt = (item.get("prompt") or "").strip().replace("\n", " ")
                 prompt_short = (prompt[:90] + "…") if len(prompt) > 90 else prompt
                 reference = " · с референсом" if item.get("has_reference") else ""
                 line = (
@@ -947,7 +1058,7 @@ async def max_webhook(
                     f"({item['created_at'].astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')})"
                 )
                 if prompt_short:
-                    line += f"\\n  {prompt_short}"
+                    line += f"\n  {prompt_short}"
                 lines.append(line)
             answer = "Последние операции:\n" + "\n".join(lines)
         show_menu, keyboard = True, None
@@ -1018,12 +1129,12 @@ async def max_webhook(
             preview = final_prompt if len(final_prompt) <= 1200 else final_prompt[:1200] + "…"
             reference_url, _ = get_photo_reference(int(user_id))
             reference_note = (
-                "Фотография-референс прикреплена.\\n\\n"
+                "Фотография-референс прикреплена.\n\n"
                 if reference_url
-                else "Фотография-референс не прикреплена.\\n\\n"
+                else "Фотография-референс не прикреплена.\n\n"
             )
             answer = (
-                f"Черновик запроса №{draft_id}:\\n\\n{reference_note}{preview}\\n\\n"
+                f"Черновик запроса №{draft_id}:\n\n{reference_note}{preview}\n\n"
                 "Проверь описание. Подтверждение только сохранит запрос для следующего этапа. "
                 "Генерация пока не запускается и кредиты не расходуются."
             )
