@@ -735,8 +735,44 @@ async def refresh_generation(user_id: int, row):
 def generation_status_keyboard():
     return message_keyboard([["Проверить генерацию"], ["Назад в меню"]])
 
+async def deliver_generation_notifications(limit: int = 20):
+    """Повторно доставляет уведомления о завершённых задачах до подтверждения MAX."""
+    with db_connect() as conn:
+        pending = conn.execute("""
+            SELECT id, max_user_id, status, result_url, last_error
+            FROM generation_history
+            WHERE status IN ('completed','failed')
+              AND notification_sent_at IS NULL
+              AND completed_at > NOW() - INTERVAL '48 hours'
+            ORDER BY completed_at, id
+            LIMIT %s
+        """, (limit,)).fetchall()
+
+    for item in pending:
+        generation_id = int(item["id"])
+        user_id = int(item["max_user_id"])
+        if item["status"] == "completed":
+            message = (
+                f"Генерация №{generation_id} готова!\\n"
+                f"Результат: {item['result_url']}"
+            )
+        else:
+            message = (
+                f"Генерация №{generation_id} не удалась. Кредиты возвращены. "
+                f"{(item['last_error'] or '')[:500]}"
+            )
+
+        # Ставим отметку только после успешного ответа MAX.
+        await send_max(user_id, message, with_menu=True)
+        with db_connect() as conn:
+            conn.execute("""
+                UPDATE generation_history SET notification_sent_at=NOW()
+                WHERE id=%s AND notification_sent_at IS NULL
+            """, (generation_id,))
+
+
 async def generation_poll_worker():
-    """Проверяет активные задачи GEN202 и автоматически сообщает о результате."""
+    """Проверяет активные задачи GEN202 и повторяет доставку уведомлений MAX."""
     await asyncio.sleep(10)
     while True:
         try:
@@ -757,27 +793,11 @@ async def generation_poll_worker():
                               g.result_url, g.reference_image_url
                 """).fetchall()
             for row in rows:
-                user_id = int(row["max_user_id"])
-                generation_id = int(row["id"])
-                await refresh_generation(user_id, row)
-                with db_connect() as conn:
-                    completed = conn.execute("""
-                        SELECT status, result_url, last_error
-                        FROM generation_history
-                        WHERE id=%s AND status IN ('completed','failed')
-                          AND notification_sent_at IS NULL
-                    """, (generation_id,)).fetchone()
-                if completed:
-                    if completed["status"] == "completed":
-                        message = f"Генерация №{generation_id} готова!\nРезультат: {completed['result_url']}"
-                    else:
-                        message = f"Генерация №{generation_id} не удалась. Кредиты возвращены. {(completed['last_error'] or '')[:500]}"
-                    await send_max(user_id, message, with_menu=True)
-                    with db_connect() as conn:
-                        conn.execute("""
-                            UPDATE generation_history SET notification_sent_at=NOW()
-                            WHERE id=%s AND notification_sent_at IS NULL
-                        """, (generation_id,))
+                await refresh_generation(int(row["max_user_id"]), row)
+
+            # Отдельная очередь: если MAX временно недоступен после завершения задачи,
+            # уведомление останется в базе и будет отправлено на следующем цикле.
+            await deliver_generation_notifications()
         except asyncio.CancelledError:
             raise
         except Exception:
