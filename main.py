@@ -684,7 +684,23 @@ async def launch_generation(user_id: int, row):
             """, (task_id, generation_id, user_id))
         return True, task_id
     except Gen202Error as exc:
-        logger.warning("GEN202 rejected task: generation_id=%s", generation_id)
+        # 4xx — документированный отказ до создания задачи; можно вернуть кредиты.
+        # 2xx без taskId и 5xx неоднозначны: не возвращаем кредит автоматически,
+        # поскольку задача могла быть принята до сбоя ответа.
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None and (status_code >= 500 or 200 <= status_code < 300):
+            logger.warning(
+                "GEN202 submission outcome ambiguous: generation_id=%s status=%s",
+                generation_id, status_code,
+            )
+            with db_connect() as conn:
+                conn.execute("""
+                    UPDATE generation_history
+                    SET status='submission_unknown', last_error=%s
+                    WHERE id=%s AND max_user_id=%s AND status='starting'
+                """, (f"GEN202 HTTP {status_code}: {type(exc).__name__}", generation_id, user_id))
+            return False, "Ответ GEN202 неоднозначен. Кредиты сохранены в резерве; повторно не запускай запрос."
+        logger.warning("GEN202 rejected task: generation_id=%s status=%s", generation_id, status_code)
         refund_generation(user_id, generation_id, f"GEN202 отклонил задачу: {str(exc)[:700]}")
         return False, "GEN202 отклонил запрос. Кредиты возвращены."
     except Exception as exc:
