@@ -1,3 +1,4 @@
+import logging
 import os
 import uuid
 from decimal import Decimal, InvalidOperation
@@ -8,6 +9,7 @@ from psycopg.rows import dict_row
 from fastapi import HTTPException
 
 YOOKASSA_API = "https://api.yookassa.ru/v3"
+logger = logging.getLogger("neuropix.yookassa")
 
 
 def _credentials() -> tuple[str, str]:
@@ -57,7 +59,27 @@ async def create_yookassa_payment(
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as exc:
-        # Не передаём пользователю секреты и полный ответ провайдера.
+        # В лог пишем только диагностические поля ответа ЮKassa.
+        # Секретный ключ, Basic Auth и данные запроса не логируются.
+        try:
+            provider_error = exc.response.json()
+        except ValueError:
+            provider_error = {}
+
+        if isinstance(provider_error, dict):
+            safe_error = {
+                key: provider_error.get(key)
+                for key in ("type", "id", "code", "description", "parameter", "field")
+                if provider_error.get(key) is not None
+            }
+        else:
+            safe_error = {}
+
+        logger.error(
+            "YooKassa payment rejected: http_status=%s provider_error=%s",
+            exc.response.status_code,
+            json.dumps(safe_error, ensure_ascii=False)[:1500],
+        )
         raise HTTPException(
             status_code=502,
             detail=f"ЮKassa отклонила создание платежа (HTTP {exc.response.status_code})",
