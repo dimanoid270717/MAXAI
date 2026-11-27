@@ -27,7 +27,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("neuropix")
 
-app = FastAPI(title="NEUROPIX AI bridge", version="1.2.1")
+app = FastAPI(title="NEUROPIX AI bridge", version="1.3.0")
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
 
@@ -184,6 +184,12 @@ def initialize_database():
         """)
         conn.execute("""
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS reference_image_token TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS resolution TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS price_credits INTEGER
         """)
     _db_initialized = True
 
@@ -398,6 +404,46 @@ def save_video_draft(user_id: int, prompt: str) -> int:
         """, (user_id, prompt)).fetchone()
     set_user_state(user_id, "waiting_video_confirmation")
     return int(row["id"])
+
+
+# Фиксированные тарифы: меняются только вместе с обновлением интерфейса.
+GENERATION_PRICES = {
+    ("image", "1K"): 15,
+    ("image", "2K"): 20,
+    ("image", "4K"): 35,
+    ("video", "480p"): 149,
+    ("video", "720p"): 299,
+}
+
+
+def quality_keyboard(kind: str):
+    if kind == "image":
+        return message_keyboard([["Фото 1K — 15 кредитов"],
+                                 ["Фото 2K — 20 кредитов"],
+                                 ["Фото 4K — 35 кредитов"], ["Отменить"]])
+    return message_keyboard([["Видео 480p — 149 кредитов"],
+                             ["Видео 720p — 299 кредитов"], ["Отменить"]])
+
+
+def select_draft_quality(user_id: int, kind: str, resolution: str):
+    price = GENERATION_PRICES.get((kind, resolution))
+    if price is None:
+        return None
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute("""
+            SELECT id FROM generation_history
+            WHERE max_user_id=%s AND generation_type=%s AND status='draft'
+            ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE
+        """, (user_id, kind)).fetchone()
+        if not row:
+            return None
+        conn.execute("""
+            UPDATE generation_history SET resolution=%s, price_credits=%s
+            WHERE id=%s
+        """, (resolution, price, row["id"]))
+    set_user_state(user_id, "waiting_photo_confirmation" if kind == "image" else "waiting_video_confirmation")
+    return price
 
 
 def confirm_latest_draft(user_id: int):
@@ -777,7 +823,7 @@ async def max_webhook(
             "• 1K — 15 кредитов\n• 2K — 20 кредитов\n• 4K — 35 кредитов\n\n"
             "ВИДЕО — 5 СЕКУНД\n• 480p — 149 кредитов\n• 720p — 299 кредитов\n"
             "• 1080p — временно недоступно\n\n1 кредит = 1 рубль. "
-            "Генерация пока отключена."
+            "Генерация пока отключена, кредиты не списываются."
         )
     elif command == "купить кредиты":
         answer = (
@@ -919,12 +965,29 @@ async def max_webhook(
             set_user_state(user_id, "waiting_photo_prompt")
             answer = "Напиши новое описание фото."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command in (
+        "фото 1k — 15 кредитов", "фото 2k — 20 кредитов", "фото 4k — 35 кредитов",
+        "видео 480p — 149 кредитов", "видео 720p — 299 кредитов",
+    ):
+        is_video = command.startswith("видео")
+        kind = "video" if is_video else "image"
+        resolution = command.split()[1].upper() if not is_video else command.split()[1]
+        price = select_draft_quality(user_id, kind, resolution)
+        if price is None:
+            answer = "Не нашёл черновик для выбора качества. Создай новый запрос."
+        else:
+            answer = (
+                f"Выбрано качество {resolution}, стоимость {price} кредитов.\n"
+                "Нажми «Подтвердить запрос», чтобы сохранить черновик.\n"
+                "Платная генерация пока отключена, кредиты не списываются."
+            )
+            show_menu, keyboard = False, confirmation_keyboard()
     elif command in ("подтвердить запрос", "подтвердить"):
         confirmed, kind = confirm_latest_draft(user_id)
         answer = (
             f"Черновик {'фото' if kind == 'image' else 'видео'} сохранён. "
             "Генерация пока отключена, кредиты не списаны."
-            if confirmed else "Нет подготовленного запроса для подтверждения."
+            if confirmed else "Сначала выбери качество для подготовленного запроса."
         )
     elif state == "waiting_photo_prompt":
         if len(message_text) < 5:
@@ -939,9 +1002,9 @@ async def max_webhook(
                 f"Черновик запроса №{draft_id}:\n\n"
                 f"{'Фотография-референс прикреплена.' if ref_url else 'Фотография-референс не прикреплена.'}\n\n"
                 f"{prompt[:1200]}\n\n"
-                "Подтверждение сохранит запрос. Генерация пока не запускается."
+                "Выбери качество и стоимость. Генерация пока не запускается."
             )
-            show_menu, keyboard = False, confirmation_keyboard()
+            show_menu, keyboard = False, quality_keyboard("image")
     elif state == "waiting_video_prompt":
         if len(message_text) < 5:
             answer = "Добавь деталей: что происходит, как движется камера и сколько длится сцена."
@@ -952,11 +1015,11 @@ async def max_webhook(
             set_prompt_prefix(user_id, None)
             answer = (
                 f"Черновик видео №{draft_id}:\n\n{prompt[:1200]}\n\n"
-                "Подтверждение сохранит запрос. Генерация пока не запускается."
+                "Выбери качество и стоимость. Генерация пока не запускается."
             )
-            show_menu, keyboard = False, confirmation_keyboard()
+            show_menu, keyboard = False, quality_keyboard("video")
     elif state in ("waiting_photo_confirmation", "waiting_video_confirmation"):
-        answer = "Сначала подтверди подготовленный запрос, измени описание или отмени его."
+        answer = "Подтверди подготовленный запрос, измени описание или отмени его."
         show_menu, keyboard = False, confirmation_keyboard()
     else:
         answer = "Не понял команду. Выбери раздел кнопками меню ниже."
