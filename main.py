@@ -806,14 +806,6 @@ async def generate_image(body: ImageRequest):
 async def generate_video(body: VideoRequest):
     raise HTTPException(status_code=403, detail="Используй запуск через подтверждённый заказ в MAX")
 
-@app.get("/tasks/{task_id}")
-async def task_status(task_id: str):
-    try:
-        return await Gen202Client().get_task(task_id)
-    except Gen202Error as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @app.get("/payment/return")
 async def payment_return():
     return {"message": "Возврат после оплаты. Проверь баланс кредитов в NEUROPIX."}

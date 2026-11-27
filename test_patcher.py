@@ -1,7 +1,7 @@
 import unittest, tempfile, os, runpy, contextlib, io
 from pathlib import Path
 
-PATCHER = Path(__file__).resolve().parents[1] / "apply_neuropix_2.py"
+PATCHER = Path(__file__).resolve().parent / "apply_neuropix_2.py"
 MAIN = """from fastapi import FastAPI, HTTPException
 from gen202 import Gen202Client, Gen202Error
 app = FastAPI()
