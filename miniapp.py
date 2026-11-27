@@ -140,6 +140,7 @@ async def miniapp_me(authorization: str | None = Header(default=None)):
         "balance": int(row["balance"]) if row else 0,
         "generation_enabled": os.getenv("ENABLE_PAID_GENERATION", "false").lower() in ("1", "true", "yes", "on"),
         "payments_configured": bool(os.getenv("YOOKASSA_SHOP_ID") and os.getenv("YOOKASSA_SECRET_KEY")),
+        "payments_enabled": os.getenv("ENABLE_PAYMENTS", "false").strip().lower() in ("1", "true", "yes", "on"),
     }
 
 
