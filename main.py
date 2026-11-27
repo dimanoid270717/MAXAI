@@ -15,12 +15,15 @@ from yookassa import (
     create_yookassa_payment,
     save_payment_id,
     fetch_yookassa_payment,
+    fetch_yookassa_refund,
     credit_paid_order,
+    mark_payment_cancelled,
+    process_yookassa_refund,
 )
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="1.0.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="1.1.0")
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
 
@@ -119,6 +122,15 @@ def initialize_database():
             CREATE UNIQUE INDEX IF NOT EXISTS purchase_orders_provider_payment_unique
             ON purchase_orders(provider_payment_id)
             WHERE provider_payment_id IS NOT NULL
+        """)
+        conn.execute("""
+            ALTER TABLE purchase_orders
+            ADD COLUMN IF NOT EXISTS provider_refund_id TEXT
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS purchase_orders_provider_refund_unique
+            ON purchase_orders(provider_refund_id)
+            WHERE provider_refund_id IS NOT NULL
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS purchase_orders_user_created_idx
@@ -522,27 +534,42 @@ async def payment_return():
 @app.post("/webhook/yookassa")
 async def yookassa_webhook(request: Request):
     notification = await request.json()
-    if notification.get("event") != "payment.succeeded":
-        return {"ok": True}
-    payment_id = (notification.get("object") or {}).get("id")
-    if not payment_id:
+    event = notification.get("event")
+    obj = notification.get("object") or {}
+    database_url = required_env("DATABASE_URL")
+
+    if event in ("payment.succeeded", "payment.canceled"):
+        payment_id = obj.get("id")
+        if not payment_id:
+            return {"ok": True}
+        payment = await fetch_yookassa_payment(str(payment_id))
+        if event == "payment.succeeded":
+            credited = credit_paid_order(database_url, payment)
+            if credited:
+                order_code = (payment.get("metadata") or {}).get("order_code")
+                with db_connect() as conn:
+                    order = conn.execute(
+                        "SELECT max_user_id, package_credits FROM purchase_orders WHERE order_code=%s",
+                        (order_code,),
+                    ).fetchone()
+                if order:
+                    await send_max(
+                        int(order["max_user_id"]),
+                        f"Оплата получена! Начислено {order['package_credits']} кредитов.",
+                        with_menu=True,
+                    )
+        else:
+            mark_payment_cancelled(database_url, payment)
         return {"ok": True}
 
-    payment = await fetch_yookassa_payment(str(payment_id))
-    credited = credit_paid_order(required_env("DATABASE_URL"), payment)
-    if credited:
-        order_code = (payment.get("metadata") or {}).get("order_code")
-        with db_connect() as conn:
-            order = conn.execute("""
-                SELECT max_user_id, package_credits FROM purchase_orders
-                WHERE order_code=%s
-            """, (order_code,)).fetchone()
-        if order:
-            await send_max(
-                int(order["max_user_id"]),
-                f"Оплата получена! Начислено {order['package_credits']} кредитов.",
-                with_menu=True,
-            )
+    if event == "refund.succeeded":
+        refund_id = obj.get("id")
+        if not refund_id:
+            return {"ok": True}
+        refund = await fetch_yookassa_refund(str(refund_id))
+        result = process_yookassa_refund(database_url, refund)
+        return {"ok": True, "refund_result": result}
+
     return {"ok": True}
 
 
@@ -700,6 +727,8 @@ async def max_webhook(
                 "paid": "оплачен",
                 "cancelled": "отменён",
                 "failed": "ошибка оплаты",
+                "refunded": "возврат выполнен",
+                "refund_review": "возврат — нужна проверка",
             }
             answer = "ТВОИ ЗАКАЗЫ\n\n" + "\n".join(
                 f"• {o['order_code']} — {o['package_credits']} кредитов, "
