@@ -10,7 +10,9 @@ import httpx
 
 
 class Gen202Error(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class Gen202Client:
@@ -73,19 +75,27 @@ class Gen202Client:
             payload = response.json()
         except ValueError as exc:
             raise Gen202Error(
-                f"GEN202 вернул не JSON (HTTP {response.status_code})"
+                f"GEN202 вернул не JSON (HTTP {response.status_code})",
+                status_code=response.status_code,
             ) from exc
 
         if response.is_error or payload.get("code") not in (200, None):
+            code = payload.get("code")
+            try:
+                code = int(code) if code is not None else response.status_code
+            except (TypeError, ValueError):
+                code = response.status_code
             raise Gen202Error(
-                str(payload.get("msg") or payload)
+                str(payload.get("msg") or payload),
+                status_code=code,
             )
 
         task_id = (payload.get("data") or {}).get("taskId")
 
         if not task_id:
             raise Gen202Error(
-                f"В ответе GEN202 нет taskId: {payload}"
+                f"В ответе GEN202 нет taskId: {payload}",
+                status_code=response.status_code,
             )
 
         return {
