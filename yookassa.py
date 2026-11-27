@@ -41,7 +41,7 @@ async def create_yookassa_payment(
         "payment_method_data": {"type": payment_method},
         "confirmation": {
             "type": "redirect",
-            "return_url": "https://maxai-tls6.onrender.com/payment/return",
+            "return_url": os.getenv("PUBLIC_BASE_URL", "https://maxai-1-nxzp.onrender.com").rstrip("/") + "/payment/return",
         },
         "description": f"NEUROPIX: {credits} кредитов, заказ {order_code}",
         "metadata": {
@@ -54,7 +54,7 @@ async def create_yookassa_payment(
             response = await client.post(
                 f"{YOOKASSA_API}/payments",
                 auth=(shop_id, secret),
-                headers={"Idempotence-Key": str(uuid.uuid4())},
+                headers={"Idempotence-Key": str(uuid.uuid5(uuid.NAMESPACE_URL, f"neuropix:yookassa:{order_code}:{payment_method}"))},
                 json=payload,
             )
             response.raise_for_status()
@@ -335,21 +335,3 @@ def credit_paid_order(database_url: str, payment: dict) -> bool:
             (int(order["id"]),),
         )
         return True
-
-
-async def fetch_yookassa_refund(refund_id: str) -> dict:
-    """Получает актуальный возврат напрямую из API ЮKassa."""
-    shop_id, secret = _credentials()
-    try:
-        async with httpx.AsyncClient(timeout=25) as client:
-            response = await client.get(
-                f"{YOOKASSA_API}/refunds/{refund_id}",
-                auth=(shop_id, secret),
-            )
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Не удалось проверить возврат в ЮKassa",
-        ) from exc

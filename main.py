@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import secrets
@@ -79,6 +80,26 @@ def initialize_database():
     if _db_initialized:
         return
     with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_max_events (
+                event_key TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'processing',
+                claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                processed_at TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS processed_max_events_processed_at_idx
+            ON processed_max_events(processed_at)
+        """)
+        conn.execute("""
+            ALTER TABLE processed_max_events
+            ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'processed'
+        """)
+        conn.execute("""
+            ALTER TABLE processed_max_events
+            ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 max_user_id BIGINT PRIMARY KEY,
@@ -197,7 +218,54 @@ def initialize_database():
         conn.execute("""
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ
         """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS submission_started_at TIMESTAMPTZ
+        """)
     _db_initialized = True
+
+
+def max_event_key(update: dict) -> str | None:
+    """Stable key for MAX message_created webhook retries."""
+    if update.get("update_type") != "message_created":
+        return None
+    message = update.get("message") or {}
+    body = message.get("body") or {}
+    mid = body.get("mid") or message.get("mid")
+    if not mid:
+        return None
+    return f"max:message_created:{str(mid)}"
+
+
+def claim_max_event(event_key: str) -> bool:
+    """Atomically claim a webhook event; False means it was already processed."""
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute("""
+            INSERT INTO processed_max_events(event_key, status, claimed_at)
+            VALUES (%s, 'processing', NOW())
+            ON CONFLICT(event_key) DO UPDATE
+            SET status='processing', claimed_at=NOW()
+            WHERE processed_max_events.status <> 'processed'
+              AND processed_max_events.claimed_at < NOW() - INTERVAL '5 minutes'
+            RETURNING event_key
+        """, (event_key,)).fetchone()
+    return bool(row)
+
+
+def mark_max_event_processed(event_key: str) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute("""
+            UPDATE processed_max_events
+            SET status='processed', processed_at=NOW()
+            WHERE event_key=%s AND status='processing'
+        """, (event_key,))
 
 
 def save_user(user_id: int, username=None, first_name=None):
@@ -532,7 +600,8 @@ def debit_generation(user_id: int, generation_id: int) -> tuple[bool, str]:
         conn.execute("UPDATE users SET balance=balance-%s, last_seen_at=NOW() WHERE max_user_id=%s",
                      (price, user_id))
         conn.execute("""
-            UPDATE generation_history SET status='starting', last_error=NULL
+            UPDATE generation_history
+            SET status='starting', last_error=NULL, submission_started_at=NOW()
             WHERE id=%s AND max_user_id=%s
         """, (generation_id, user_id))
     return True, "ok"
@@ -619,7 +688,23 @@ async def launch_generation(user_id: int, row):
             """, (task_id, generation_id, user_id))
         return True, task_id
     except Gen202Error as exc:
-        logger.warning("GEN202 rejected task: generation_id=%s", generation_id)
+        # 4xx — документированный отказ до создания задачи; можно вернуть кредиты.
+        # 2xx без taskId и 5xx неоднозначны: не возвращаем кредит автоматически,
+        # поскольку задача могла быть принята до сбоя ответа.
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None and (status_code >= 500 or 200 <= status_code < 300):
+            logger.warning(
+                "GEN202 submission outcome ambiguous: generation_id=%s status=%s",
+                generation_id, status_code,
+            )
+            with db_connect() as conn:
+                conn.execute("""
+                    UPDATE generation_history
+                    SET status='submission_unknown', last_error=%s
+                    WHERE id=%s AND max_user_id=%s AND status='starting'
+                """, (f"GEN202 HTTP {status_code}: {type(exc).__name__}", generation_id, user_id))
+            return False, "Ответ GEN202 неоднозначен. Кредиты сохранены в резерве; повторно не запускай запрос."
+        logger.warning("GEN202 rejected task: generation_id=%s status=%s", generation_id, status_code)
         refund_generation(user_id, generation_id, f"GEN202 отклонил задачу: {str(exc)[:700]}")
         return False, "GEN202 отклонил запрос. Кредиты возвращены."
     except Exception as exc:
@@ -658,7 +743,7 @@ async def refresh_generation(user_id: int, row):
                 UPDATE generation_history SET status='completed', result_url=%s, completed_at=NOW()
                 WHERE id=%s AND max_user_id=%s
             """, (urls[0], generation_id, user_id))
-        return "Готово! Ссылка на результат:\\n" + "\\n".join(urls[:4])
+        return "Готово! Ссылка на результат:\n" + "\n".join(urls[:4])
     if state in ("fail", "failed", "error"):
         reason = str(status.get("fail_message") or status.get("fail_code") or "Ошибка GEN202")
         refunded = refund_generation(user_id, generation_id, f"Ошибка GEN202: {reason}")
@@ -669,6 +754,105 @@ async def refresh_generation(user_id: int, row):
 
 def generation_status_keyboard():
     return message_keyboard([["Проверить генерацию"], ["Назад в меню"]])
+
+async def deliver_generation_notifications(limit: int = 20):
+    """Повторно доставляет уведомления о завершённых задачах до подтверждения MAX."""
+    with db_connect() as conn:
+        pending = conn.execute("""
+            SELECT id, max_user_id, status, result_url, last_error
+            FROM generation_history
+            WHERE status IN ('completed','failed')
+              AND notification_sent_at IS NULL
+              AND completed_at > NOW() - INTERVAL '48 hours'
+            ORDER BY completed_at, id
+            LIMIT %s
+        """, (limit,)).fetchall()
+
+    for item in pending:
+        generation_id = int(item["id"])
+        user_id = int(item["max_user_id"])
+        if item["status"] == "completed":
+            message = (
+                f"Генерация №{generation_id} готова!\n"
+                f"Результат: {item['result_url']}"
+            )
+        else:
+            message = (
+                f"Генерация №{generation_id} не удалась. Кредиты возвращены. "
+                f"{(item['last_error'] or '')[:500]}"
+            )
+
+        # Ставим отметку только после успешного ответа MAX.
+        await send_max(user_id, message, with_menu=True)
+        with db_connect() as conn:
+            conn.execute("""
+                UPDATE generation_history SET notification_sent_at=NOW()
+                WHERE id=%s AND notification_sent_at IS NULL
+            """, (generation_id,))
+
+
+async def generation_poll_worker():
+    """Проверяет активные задачи GEN202 и повторяет доставку уведомлений MAX."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            initialize_database()
+            # Если процесс умер после списания, но до сохранения taskId,
+            # не повторяем платный запрос: переводим запись в ручную сверку.
+            with db_connect() as conn:
+                conn.execute("""
+                    UPDATE generation_history
+                    SET status='submission_unknown',
+                        last_error='Процесс завершился до сохранения taskId; требуется сверка с GEN202',
+                        last_checked_at=NOW()
+                    WHERE status='starting'
+                      AND submission_started_at < NOW() - INTERVAL '2 minutes'
+                """)
+            with db_connect() as conn:
+                rows = conn.execute("""
+                    WITH due AS (
+                        SELECT id FROM generation_history
+                        WHERE status='processing' AND provider_task_id IS NOT NULL
+                          AND created_at > NOW() - INTERVAL '48 hours'
+                          AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 seconds')
+                        ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 10
+                    )
+                    UPDATE generation_history AS g SET last_checked_at=NOW()
+                    FROM due WHERE g.id=due.id
+                    RETURNING g.id, g.max_user_id, g.generation_type, g.prompt,
+                              g.resolution, g.price_credits, g.status, g.provider_task_id,
+                              g.result_url, g.reference_image_url
+                """).fetchall()
+            for row in rows:
+                await refresh_generation(int(row["max_user_id"]), row)
+
+            # Отдельная очередь: если MAX временно недоступен после завершения задачи,
+            # уведомление останется в базе и будет отправлено на следующем цикле.
+            await deliver_generation_notifications()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Generation polling worker iteration failed")
+        await asyncio.sleep(15)
+
+_generation_worker_task: asyncio.Task | None = None
+
+@app.on_event("startup")
+async def start_generation_poll_worker():
+    global _generation_worker_task
+    if _generation_worker_task is None or _generation_worker_task.done():
+        _generation_worker_task = asyncio.create_task(generation_poll_worker())
+
+@app.on_event("shutdown")
+async def stop_generation_poll_worker():
+    global _generation_worker_task
+    if _generation_worker_task and not _generation_worker_task.done():
+        _generation_worker_task.cancel()
+        try:
+            await _generation_worker_task
+        except asyncio.CancelledError:
+            pass
+    _generation_worker_task = None
 
 def max_ssl_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
@@ -806,14 +990,6 @@ async def generate_image(body: ImageRequest):
 async def generate_video(body: VideoRequest):
     raise HTTPException(status_code=403, detail="Используй запуск через подтверждённый заказ в MAX")
 
-@app.get("/tasks/{task_id}")
-async def task_status(task_id: str):
-    try:
-        return await Gen202Client().get_task(task_id)
-    except Gen202Error as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @app.get("/payment/return")
 async def payment_return():
     return {"message": "Возврат после оплаты. Проверь баланс кредитов в NEUROPIX."}
@@ -888,6 +1064,10 @@ async def max_webhook(
         return {"ok": True}
 
     message = update.get("message") or {}
+    event_key = max_event_key(update)
+    if event_key and not claim_max_event(event_key):
+        return {"ok": True, "duplicate": True}
+
     sender = message.get("sender") or {}
     user_id = sender.get("user_id")
     body = message.get("body") or {}
@@ -1211,6 +1391,8 @@ async def max_webhook(
         answer = "Не понял команду. Выбери раздел кнопками меню ниже."
 
     await send_max(user_id, answer, with_menu=show_menu, keyboard=keyboard)
+    if event_key:
+        mark_max_event_processed(event_key)
     return {"ok": True}
 
 
@@ -1242,3 +1424,7 @@ async def register_webhook(x_admin_secret: str | None = Header(default=None)):
     if response.is_error or (isinstance(data, dict) and data.get("success") is False):
         raise HTTPException(status_code=502, detail={"status": response.status_code, "response": data})
     return {"ok": True, "response": data}
+
+
+from miniapp import router as miniapp_router
+app.include_router(miniapp_router)
