@@ -1424,3 +1424,7 @@ async def register_webhook(x_admin_secret: str | None = Header(default=None)):
     if response.is_error or (isinstance(data, dict) and data.get("success") is False):
         raise HTTPException(status_code=502, detail={"status": response.status_code, "response": data})
     return {"ok": True, "response": data}
+
+
+from miniapp import router as miniapp_router
+app.include_router(miniapp_router)
