@@ -753,7 +753,7 @@ async def deliver_generation_notifications(limit: int = 20):
         user_id = int(item["max_user_id"])
         if item["status"] == "completed":
             message = (
-                f"Генерация №{generation_id} готова!\\n"
+                f"Генерация №{generation_id} готова!\n"
                 f"Результат: {item['result_url']}"
             )
         else:
