@@ -111,6 +111,13 @@ def initialize_database() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    max_user_id BIGINT PRIMARY KEY REFERENCES users(max_user_id),
+                    state TEXT NOT NULL DEFAULT 'idle',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         _db_initialized = True
     except HTTPException:
         raise
@@ -187,6 +194,85 @@ def get_user_history(user_id: int, limit: int = 5) -> list[dict]:
         ) from exc
 
 
+def set_user_state(user_id: int, state: str) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_sessions (max_user_id, state)
+            VALUES (%s, %s)
+            ON CONFLICT (max_user_id) DO UPDATE SET
+                state = EXCLUDED.state,
+                updated_at = NOW()
+            """,
+            (user_id, state),
+        )
+
+
+def get_user_state(user_id: int) -> str:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT state FROM user_sessions WHERE max_user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return row["state"] if row else "idle"
+
+
+def save_photo_draft(user_id: int, prompt: str) -> int:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO generation_history
+                (max_user_id, generation_type, prompt, status)
+            VALUES (%s, 'image', %s, 'draft')
+            RETURNING id
+            """,
+            (user_id, prompt),
+        ).fetchone()
+    set_user_state(user_id, "waiting_photo_confirmation")
+    return int(row["id"])
+
+
+def confirm_latest_photo_draft(user_id: int) -> bool:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM generation_history
+            WHERE max_user_id = %s AND generation_type = 'image' AND status = 'draft'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE generation_history SET status = 'ready_for_generation' WHERE id = %s AND max_user_id = %s",
+            (row["id"], user_id),
+        )
+    set_user_state(user_id, "idle")
+    return True
+
+
+def cancel_latest_photo_draft(user_id: int) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE generation_history SET status = 'cancelled'
+            WHERE id = (
+                SELECT id FROM generation_history
+                WHERE max_user_id = %s AND generation_type = 'image' AND status = 'draft'
+                ORDER BY created_at DESC LIMIT 1
+            )
+            """,
+            (user_id,),
+        )
+    set_user_state(user_id, "idle")
+
+
 def max_ssl_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
     ca_file = os.getenv("MAX_CA_FILE", "").strip()
@@ -213,24 +299,39 @@ def max_headers() -> dict[str, str]:
     }
 
 
+def message_keyboard(rows: list[list[str]]) -> list[list[dict]]:
+    return [[{"type": "message", "text": label} for label in row] for row in rows]
+
+
 def main_keyboard() -> list[list[dict]]:
-    return [
-        [{"type": "message", "text": "Создать фото"},
-         {"type": "message", "text": "Создать видео"}],
-        [{"type": "message", "text": "Каталог эффектов"}],
-        [{"type": "message", "text": "Мой баланс"},
-         {"type": "message", "text": "Купить кредиты"}],
-        [{"type": "message", "text": "История"},
-         {"type": "message", "text": "Поддержка"}],
-    ]
+    return message_keyboard([
+        ["Создать фото", "Создать видео"],
+        ["Каталог эффектов"],
+        ["Мой баланс", "Купить кредиты"],
+        ["История", "Поддержка"],
+    ])
 
 
-async def send_max(user_id: int, text: str, *, with_menu: bool = False) -> None:
+def photo_confirmation_keyboard() -> list[list[dict]]:
+    return message_keyboard([
+        ["Подтвердить запрос"],
+        ["Изменить описание", "Отменить"],
+    ])
+
+
+async def send_max(
+    user_id: int,
+    text: str,
+    *,
+    with_menu: bool = False,
+    keyboard: list[list[dict]] | None = None,
+) -> None:
     payload = {"text": text[:4000]}
-    if with_menu:
+    selected_keyboard = keyboard if keyboard is not None else (main_keyboard() if with_menu else None)
+    if selected_keyboard:
         payload["attachments"] = [{
             "type": "inline_keyboard",
-            "payload": {"buttons": main_keyboard()},
+            "payload": {"buttons": selected_keyboard},
         }]
 
     try:
@@ -365,70 +466,96 @@ async def max_webhook(
         return {"ok": True}
 
     command = message_text.lower()
+    current_state = get_user_state(int(user_id))
 
     if command in ("/start", "старт", "начать", "меню", "главное меню"):
+        set_user_state(int(user_id), "idle")
         answer = "NEUROPIX — создание ИИ-фото и видео. Выбери нужный раздел:"
-        show_menu = True
+        show_menu, keyboard = True, None
     elif command in ("/help", "помощь"):
-        answer = (
-            "Выбери раздел кнопками ниже.\n"
-            "Генерация и оплата пока не включены."
-        )
-        show_menu = True
+        answer = "Выбери раздел кнопками ниже. Подготовка запроса на фото доступна, запуск генерации и оплата пока отключены."
+        show_menu, keyboard = True, None
     elif command in ("создать фото", "фото"):
+        set_user_state(int(user_id), "waiting_photo_prompt")
         answer = (
-            "Создание фото выбрано. Скоро подключим загрузку референса, "
-            "промпт и Nano Banana 2.1. Сейчас запуск отключён — кредиты не расходуются."
+            "Опиши, какое фото хочешь получить. Напиши подробный запрос одним сообщением: "
+            "кто или что должно быть на изображении, стиль, фон, одежда, освещение и формат. "
+            "Пока принимаем текстовое описание; загрузку фото-референса добавим следующим этапом. "
+            "Генерация не запустится и кредиты не спишутся."
         )
-        show_menu = True
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command in ("создать видео", "видео"):
-        answer = (
-            "Создание видео выбрано. Скоро подключим промпт, референсы "
-            "и Seedance 2.5. Сейчас запуск отключён — кредиты не расходуются."
-        )
-        show_menu = True
+        answer = "Создание видео пока находится в разработке. Выбери «Создать фото» или вернись в главное меню."
+        show_menu, keyboard = True, None
     elif command == "каталог эффектов":
-        answer = (
-            "Каталог эффектов готовится: кинематографичный портрет, смена образа, "
-            "оживление фото, рекламный ролик и другие шаблоны."
-        )
-        show_menu = True
+        answer = "Каталог эффектов готовится: кинематографичный портрет, смена образа, оживление фото, рекламный ролик и другие шаблоны."
+        show_menu, keyboard = True, None
     elif command == "мой баланс":
         balance = get_user_balance(int(user_id))
-        answer = f"Твой баланс: {balance} кредитов.\nПокупка и начисление кредитов пока не включены."
-        show_menu = True
+        answer = f"Твой баланс: {balance} кредитов. Покупка и начисление кредитов пока не включены."
+        show_menu, keyboard = True, None
     elif command == "купить кредиты":
-        answer = (
-            "Покупка кредитов пока не подключена. Сначала настроим платёжный "
-            "сервис и безопасное автоматическое начисление."
-        )
-        show_menu = True
+        answer = "Покупка кредитов пока не подключена. Сначала настроим платёжный сервис и безопасное автоматическое начисление."
+        show_menu, keyboard = True, None
     elif command == "история":
         history = get_user_history(int(user_id))
         if not history:
-            answer = "История пока пустая. Здесь будут отображаться твои генерации."
+            answer = "История пока пустая. Здесь будут отображаться твои генерации и подготовленные запросы."
         else:
             lines = [
                 f"• {item['generation_type']} — {item['status']} "
                 f"({item['created_at'].astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')})"
                 for item in history
             ]
-            answer = "Последние операции:\n" + "\n".join(lines)
-        show_menu = True
+            answer = "Последние операции:\\n" + "\\n".join(lines)
+        show_menu, keyboard = True, None
     elif command == "поддержка":
-        answer = "По вопросам работы NEUROPIX напиши администратору: контакт поддержки будет добавлен перед запуском."
-        show_menu = True
+        answer = "По вопросам работы NEUROPIX контакт поддержки будет добавлен перед запуском."
+        show_menu, keyboard = True, None
+    elif command in ("отменить", "отмена"):
+        cancel_latest_photo_draft(int(user_id))
+        answer = "Подготовка запроса отменена. Выбери следующий раздел:"
+        show_menu, keyboard = True, None
+    elif command in ("изменить описание", "изменить"):
+        set_user_state(int(user_id), "waiting_photo_prompt")
+        answer = "Напиши новое описание изображения."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command in ("подтвердить запрос", "подтвердить"):
+        if confirm_latest_photo_draft(int(user_id)):
+            answer = (
+                "Запрос сохранён и готов к следующему этапу. Сама генерация пока отключена: "
+                "кредиты не списаны, задача в GEN202 не создавалась."
+            )
+        else:
+            answer = "Нет подготовленного запроса для подтверждения."
+        show_menu, keyboard = True, None
+    elif current_state == "waiting_photo_prompt":
+        if len(message_text) < 5:
+            answer = "Добавь немного деталей — описание слишком короткое. Напиши, что именно должно быть на фото."
+            show_menu, keyboard = False, message_keyboard([["Отменить"]])
+        else:
+            draft_id = save_photo_draft(int(user_id), message_text[:20000])
+            preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
+            answer = (
+                f"Черновик запроса №{draft_id}:\\n\\n{preview}\\n\\n"
+                "Проверь описание. Подтверждение только сохранит запрос для следующего этапа. "
+                "Генерация пока не запускается и кредиты не расходуются."
+            )
+            show_menu, keyboard = False, photo_confirmation_keyboard()
+    elif current_state == "waiting_photo_confirmation":
+        answer = "Сначала подтверди подготовленный запрос, измени описание или отмени его."
+        show_menu, keyboard = False, photo_confirmation_keyboard()
     elif command.startswith(("фото:", "image:")):
-        answer = "Запрос принят, но генерация пока отключена. Кредиты не расходуются."
-        show_menu = True
+        answer = "Чтобы подготовить фото, нажми «Создать фото» и отправь описание."
+        show_menu, keyboard = True, None
     elif command.startswith(("видео:", "video:")):
-        answer = "Запрос принят, но генерация пока отключена. Кредиты не расходуются."
-        show_menu = True
+        answer = "Создание видео пока отключено."
+        show_menu, keyboard = True, None
     else:
         answer = "Не понял команду. Выбери раздел кнопками меню ниже."
-        show_menu = True
+        show_menu, keyboard = True, None
 
-    await send_max(int(user_id), answer, with_menu=show_menu)
+    await send_max(int(user_id), answer, with_menu=show_menu, keyboard=keyboard)
     return {"ok": True}
 
 
