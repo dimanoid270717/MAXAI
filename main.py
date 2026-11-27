@@ -27,7 +27,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("neuropix")
 
-app = FastAPI(title="NEUROPIX AI bridge", version="1.3.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="1.4.0")
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
 
@@ -190,6 +190,12 @@ def initialize_database():
         """)
         conn.execute("""
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS price_credits INTEGER
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS last_error TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ
         """)
     _db_initialized = True
 
@@ -490,6 +496,180 @@ def cancel_latest_draft(user_id: int):
     set_user_state(user_id, "idle")
 
 
+
+def generation_enabled() -> bool:
+    return os.getenv("ENABLE_PAID_GENERATION", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def debit_generation(user_id: int, generation_id: int) -> tuple[bool, str]:
+    initialize_database()
+    key = f"generation:{generation_id}:charge"
+    with db_connect() as conn:
+        row = conn.execute("""
+            SELECT id, generation_type, resolution, price_credits, status
+            FROM generation_history WHERE id=%s AND max_user_id=%s FOR UPDATE
+        """, (generation_id, user_id)).fetchone()
+        if not row:
+            return False, "Запрос не найден."
+        if row["status"] not in ("draft", "ready_for_generation"):
+            return False, "Этот запрос уже обрабатывается или завершён."
+        price = int(row["price_credits"] or 0)
+        if price <= 0 or not row["resolution"]:
+            return False, "Сначала выбери качество генерации."
+        user = conn.execute(
+            "SELECT balance FROM users WHERE max_user_id=%s FOR UPDATE", (user_id,)
+        ).fetchone()
+        if not user or int(user["balance"]) < price:
+            return False, f"Недостаточно кредитов. Нужно {price}, на балансе {int(user['balance']) if user else 0}."
+        inserted = conn.execute("""
+            INSERT INTO credit_transactions(max_user_id, amount, reason, idempotency_key)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+            DO NOTHING RETURNING id
+        """, (user_id, -price, f"Генерация {row['generation_type']} №{generation_id}", key)).fetchone()
+        if not inserted:
+            return False, "Списание по этому запросу уже зарегистрировано."
+        conn.execute("UPDATE users SET balance=balance-%s, last_seen_at=NOW() WHERE max_user_id=%s",
+                     (price, user_id))
+        conn.execute("""
+            UPDATE generation_history SET status='starting', last_error=NULL
+            WHERE id=%s AND max_user_id=%s
+        """, (generation_id, user_id))
+    return True, "ok"
+
+
+def refund_generation(user_id: int, generation_id: int, reason: str):
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute("""
+            SELECT price_credits FROM generation_history
+            WHERE id=%s AND max_user_id=%s FOR UPDATE
+        """, (generation_id, user_id)).fetchone()
+        if not row:
+            return False
+        price = int(row["price_credits"] or 0)
+        if price <= 0:
+            return False
+        key = f"generation:{generation_id}:refund"
+        inserted = conn.execute("""
+            INSERT INTO credit_transactions(max_user_id, amount, reason, idempotency_key)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+            DO NOTHING RETURNING id
+        """, (user_id, price, reason[:250], key)).fetchone()
+        if not inserted:
+            return False
+        conn.execute("UPDATE users SET balance=balance+%s, last_seen_at=NOW() WHERE max_user_id=%s",
+                     (price, user_id))
+        conn.execute("""
+            UPDATE generation_history SET status='failed', last_error=%s, completed_at=NOW()
+            WHERE id=%s AND max_user_id=%s
+        """, (reason[:1000], generation_id, user_id))
+    return True
+
+
+def get_latest_draft(user_id: int):
+    initialize_database()
+    with db_connect() as conn:
+        return conn.execute("""
+            SELECT id, generation_type, prompt, resolution, price_credits,
+                   status, reference_image_url
+            FROM generation_history
+            WHERE max_user_id=%s AND status IN ('draft','ready_for_generation')
+            ORDER BY created_at DESC, id DESC LIMIT 1
+        """, (user_id,)).fetchone()
+
+
+def get_latest_active_generation(user_id: int):
+    initialize_database()
+    with db_connect() as conn:
+        return conn.execute("""
+            SELECT id, generation_type, prompt, resolution, price_credits,
+                   status, provider_task_id, result_url, reference_image_url
+            FROM generation_history
+            WHERE max_user_id=%s AND status IN ('starting','processing','submission_unknown')
+            ORDER BY created_at DESC, id DESC LIMIT 1
+        """, (user_id,)).fetchone()
+
+
+async def launch_generation(user_id: int, row):
+    generation_id = int(row["id"])
+    if not generation_enabled():
+        return False, "Платная генерация пока отключена. Кредиты не списаны."
+    ok, message = debit_generation(user_id, generation_id)
+    if not ok:
+        return False, message
+    try:
+        client = Gen202Client()
+        if row["generation_type"] == "image":
+            refs = [row["reference_image_url"]] if row["reference_image_url"] else None
+            task = await client.create_image(
+                prompt=row["prompt"] or "", resolution=row["resolution"], image_input=refs
+            )
+        else:
+            task = await client.create_video(
+                prompt=row["prompt"] or "", duration=5, resolution=row["resolution"],
+                aspect_ratio="9:16", generate_audio=True
+            )
+        task_id = str(task["task_id"])
+        with db_connect() as conn:
+            conn.execute("""
+                UPDATE generation_history SET provider_task_id=%s, status='processing'
+                WHERE id=%s AND max_user_id=%s AND status='starting'
+            """, (task_id, generation_id, user_id))
+        return True, task_id
+    except Gen202Error as exc:
+        logger.warning("GEN202 rejected task: generation_id=%s", generation_id)
+        refund_generation(user_id, generation_id, f"GEN202 отклонил задачу: {str(exc)[:700]}")
+        return False, "GEN202 отклонил запрос. Кредиты возвращены."
+    except Exception as exc:
+        # Сетевой тайм-аут не доказывает, что провайдер не принял задачу.
+        # Оставляем списание и отмечаем неопределённое состояние, чтобы не создать дубль.
+        logger.exception("GEN202 submission outcome unknown: generation_id=%s", generation_id)
+        with db_connect() as conn:
+            conn.execute("""
+                UPDATE generation_history
+                SET status='submission_unknown', last_error=%s
+                WHERE id=%s AND max_user_id=%s AND status='starting'
+            """, (type(exc).__name__, generation_id, user_id))
+        return False, "Не удалось однозначно получить ответ GEN202. Кредиты пока зарезервированы; повторно не запускай запрос — нужна проверка."
+
+
+async def refresh_generation(user_id: int, row):
+    if not row or not row["provider_task_id"]:
+        return "У задачи пока нет идентификатора GEN202. Обратись в поддержку."
+    generation_id = int(row["id"])
+    try:
+        status = await Gen202Client().get_task(str(row["provider_task_id"]))
+    except Gen202Error as exc:
+        logger.warning("GEN202 status check failed: generation_id=%s error=%s",
+                       generation_id, type(exc).__name__)
+        return "Не удалось проверить задачу. Попробуй позже; повторного списания не будет."
+    state = str(status.get("state") or "").lower()
+    if state in ("success", "succeeded", "completed"):
+        urls = status.get("result_urls") or []
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = [str(x) for x in urls if isinstance(x, str) and x.startswith(("https://", "http://"))]
+        if not urls:
+            return "GEN202 сообщил об успехе, но не вернул ссылку на результат. Задача сохранена."
+        with db_connect() as conn:
+            conn.execute("""
+                UPDATE generation_history SET status='completed', result_url=%s, completed_at=NOW()
+                WHERE id=%s AND max_user_id=%s
+            """, (urls[0], generation_id, user_id))
+        return "Готово! Ссылка на результат:\\n" + "\\n".join(urls[:4])
+    if state in ("fail", "failed", "error"):
+        reason = str(status.get("fail_message") or status.get("fail_code") or "Ошибка GEN202")
+        refunded = refund_generation(user_id, generation_id, f"Ошибка GEN202: {reason}")
+        prefix = "Генерация не удалась. Кредиты возвращены. " if refunded else "Генерация не удалась; возврат уже обработан. "
+        return prefix + reason[:400]
+    return f"Генерация выполняется. Статус: {state or 'в обработке'}. Проверь позже."
+
+
+def generation_status_keyboard():
+    return message_keyboard([["Проверить генерацию"], ["Назад в меню"]])
+
 def max_ssl_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
     ca_file = os.getenv("MAX_CA_FILE", "").strip()
@@ -620,36 +800,11 @@ async def health():
 
 @app.post("/generate/image")
 async def generate_image(body: ImageRequest):
-    try:
-        return await Gen202Client().create_image(
-            prompt=body.prompt,
-            aspect_ratio=body.aspect_ratio,
-            resolution=body.resolution,
-            output_format=body.output_format,
-            image_input=[str(x) for x in body.image_input] if body.image_input else None,
-        )
-    except Gen202Error as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
+    raise HTTPException(status_code=403, detail="Используй запуск через подтверждённый заказ в MAX")
 
 @app.post("/generate/video")
 async def generate_video(body: VideoRequest):
-    try:
-        return await Gen202Client().create_video(
-            prompt=body.prompt,
-            duration=body.duration,
-            aspect_ratio=body.aspect_ratio,
-            resolution=body.resolution,
-            generate_audio=body.generate_audio,
-            first_frame_url=str(body.first_frame_url) if body.first_frame_url else None,
-            last_frame_url=str(body.last_frame_url) if body.last_frame_url else None,
-            reference_image_urls=[str(x) for x in body.reference_image_urls] if body.reference_image_urls else None,
-            reference_video_urls=[str(x) for x in body.reference_video_urls] if body.reference_video_urls else None,
-            reference_audio_urls=[str(x) for x in body.reference_audio_urls] if body.reference_audio_urls else None,
-        )
-    except Gen202Error as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
+    raise HTTPException(status_code=403, detail="Используй запуск через подтверждённый заказ в MAX")
 
 @app.get("/tasks/{task_id}")
 async def task_status(task_id: str):
@@ -983,12 +1138,43 @@ async def max_webhook(
             )
             show_menu, keyboard = False, confirmation_keyboard()
     elif command in ("подтвердить запрос", "подтвердить"):
-        confirmed, kind = confirm_latest_draft(user_id)
-        answer = (
-            f"Черновик {'фото' if kind == 'image' else 'видео'} сохранён. "
-            "Генерация пока отключена, кредиты не списаны."
-            if confirmed else "Сначала выбери качество для подготовленного запроса."
-        )
+        draft = get_latest_draft(user_id)
+        if not draft or not draft["resolution"] or not draft["price_credits"]:
+            answer = "Сначала подготовь запрос и выбери качество."
+        elif not generation_enabled():
+            confirmed, kind = confirm_latest_draft(user_id)
+            answer = (
+                f"Черновик {'фото' if kind == 'image' else 'видео'} сохранён. "
+                "Генерация пока отключена, кредиты не списаны."
+                if confirmed else "Не удалось подтвердить черновик."
+            )
+        else:
+            launched, result = await launch_generation(user_id, draft)
+            if launched:
+                answer = (
+                    f"Задача №{draft['id']} отправлена в GEN202. "
+                    f"Списано {draft['price_credits']} кредитов. "
+                    "Когда генерация завершится, нажми «Проверить генерацию»."
+                )
+                show_menu, keyboard = False, generation_status_keyboard()
+            else:
+                answer = result
+    elif command in ("проверить генерацию", "мои генерации", "статус генерации"):
+        active = get_latest_active_generation(user_id)
+        if active:
+            answer = await refresh_generation(user_id, active)
+            show_menu, keyboard = False, generation_status_keyboard()
+        else:
+            with db_connect() as conn:
+                latest = conn.execute("""
+                    SELECT id, status, result_url FROM generation_history
+                    WHERE max_user_id=%s AND generation_type IN ('image','video')
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                """, (user_id,)).fetchone()
+            if latest and latest["status"] == "completed" and latest["result_url"]:
+                answer = f"Последний результат:\n{latest['result_url']}"
+            else:
+                answer = "Активных генераций нет."
     elif state == "waiting_photo_prompt":
         if len(message_text) < 5:
             answer = "Добавь деталей — описание слишком короткое."
