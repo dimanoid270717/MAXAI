@@ -507,7 +507,7 @@ async def max_webhook(
                 f"({item['created_at'].astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')})"
                 for item in history
             ]
-            answer = "Последние операции:\\n" + "\\n".join(lines)
+            answer = "Последние операции:\n" + "\n".join(lines)
         show_menu, keyboard = True, None
     elif command == "поддержка":
         answer = "По вопросам работы NEUROPIX контакт поддержки будет добавлен перед запуском."
@@ -537,7 +537,7 @@ async def max_webhook(
             draft_id = save_photo_draft(int(user_id), message_text[:20000])
             preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
             answer = (
-                f"Черновик запроса №{draft_id}:\\n\\n{preview}\\n\\n"
+                f"Черновик запроса №{draft_id}:\n\n{preview}\n\n"
                 "Проверь описание. Подтверждение только сохранит запрос для следующего этапа. "
                 "Генерация пока не запускается и кредиты не расходуются."
             )
