@@ -217,6 +217,12 @@ def initialize_database():
         conn.execute("""
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ
         """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ
+        """)
+        conn.execute("""
+            ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ
+        """)
     _db_initialized = True
 
 
@@ -727,6 +733,72 @@ async def refresh_generation(user_id: int, row):
 
 def generation_status_keyboard():
     return message_keyboard([["Проверить генерацию"], ["Назад в меню"]])
+
+async def generation_poll_worker():
+    """Проверяет активные задачи GEN202 и автоматически сообщает о результате."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            initialize_database()
+            with db_connect() as conn:
+                rows = conn.execute("""
+                    WITH due AS (
+                        SELECT id FROM generation_history
+                        WHERE status='processing' AND provider_task_id IS NOT NULL
+                          AND created_at > NOW() - INTERVAL '48 hours'
+                          AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 seconds')
+                        ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 10
+                    )
+                    UPDATE generation_history AS g SET last_checked_at=NOW()
+                    FROM due WHERE g.id=due.id
+                    RETURNING g.id, g.max_user_id, g.generation_type, g.prompt,
+                              g.resolution, g.price_credits, g.status, g.provider_task_id,
+                              g.result_url, g.reference_image_url
+                """).fetchall()
+            for row in rows:
+                user_id = int(row["max_user_id"])
+                generation_id = int(row["id"])
+                await refresh_generation(user_id, row)
+                with db_connect() as conn:
+                    completed = conn.execute("""
+                        UPDATE generation_history SET notification_sent_at=NOW()
+                        WHERE id=%s AND status IN ('completed','failed')
+                          AND notification_sent_at IS NULL
+                        RETURNING status, result_url, last_error
+                    """, (generation_id,)).fetchone()
+                if completed:
+                    if completed["status"] == "completed":
+                        message = f"Генерация №{generation_id} готова!\nРезультат: {completed['result_url']}"
+                    else:
+                        message = f"Генерация №{generation_id} не удалась. Кредиты возвращены. {(completed['last_error'] or '')[:500]}"
+                    try:
+                        await send_max(user_id, message, with_menu=True)
+                    except Exception:
+                        logger.exception("MAX generation notification failed: generation_id=%s", generation_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Generation polling worker iteration failed")
+        await asyncio.sleep(15)
+
+_generation_worker_task: asyncio.Task | None = None
+
+@app.on_event("startup")
+async def start_generation_poll_worker():
+    global _generation_worker_task
+    if _generation_worker_task is None or _generation_worker_task.done():
+        _generation_worker_task = asyncio.create_task(generation_poll_worker())
+
+@app.on_event("shutdown")
+async def stop_generation_poll_worker():
+    global _generation_worker_task
+    if _generation_worker_task and not _generation_worker_task.done():
+        _generation_worker_task.cancel()
+        try:
+            await _generation_worker_task
+        except asyncio.CancelledError:
+            pass
+    _generation_worker_task = None
 
 def max_ssl_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
