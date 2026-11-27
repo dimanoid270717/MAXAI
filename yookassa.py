@@ -41,7 +41,7 @@ async def create_yookassa_payment(
         "payment_method_data": {"type": payment_method},
         "confirmation": {
             "type": "redirect",
-            "return_url": "https://maxai-tls6.onrender.com/payment/return",
+            "return_url": os.getenv("PUBLIC_BASE_URL", "https://maxai-1-nxzp.onrender.com").rstrip("/") + "/payment/return",
         },
         "description": f"NEUROPIX: {credits} кредитов, заказ {order_code}",
         "metadata": {
