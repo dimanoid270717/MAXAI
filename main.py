@@ -82,7 +82,9 @@ def initialize_database():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_max_events (
                 event_key TEXT PRIMARY KEY,
-                processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                status TEXT NOT NULL DEFAULT 'processing',
+                claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                processed_at TIMESTAMPTZ
             )
         """)
         conn.execute("""
@@ -227,12 +229,25 @@ def claim_max_event(event_key: str) -> bool:
     initialize_database()
     with db_connect() as conn:
         row = conn.execute("""
-            INSERT INTO processed_max_events(event_key)
-            VALUES (%s)
-            ON CONFLICT(event_key) DO NOTHING
+            INSERT INTO processed_max_events(event_key, status, claimed_at)
+            VALUES (%s, 'processing', NOW())
+            ON CONFLICT(event_key) DO UPDATE
+            SET status='processing', claimed_at=NOW()
+            WHERE processed_max_events.status <> 'processed'
+              AND processed_max_events.claimed_at < NOW() - INTERVAL '5 minutes'
             RETURNING event_key
         """, (event_key,)).fetchone()
     return bool(row)
+
+
+def mark_max_event_processed(event_key: str) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute("""
+            UPDATE processed_max_events
+            SET status='processed', processed_at=NOW()
+            WHERE event_key=%s AND status='processing'
+        """, (event_key,))
 
 
 def save_user(user_id: int, username=None, first_name=None):
@@ -1242,6 +1257,8 @@ async def max_webhook(
         answer = "Не понял команду. Выбери раздел кнопками меню ниже."
 
     await send_max(user_id, answer, with_menu=show_menu, keyboard=keyboard)
+    if event_key:
+        mark_max_event_processed(event_key)
     return {"ok": True}
 
 
