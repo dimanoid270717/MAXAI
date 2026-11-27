@@ -71,5 +71,37 @@ class TestGenerationSafety(unittest.IsolatedAsyncioTestCase):
         refund.assert_not_called()
 
 
+    async def test_notification_marked_only_after_max_accepts_message(self):
+        pending = [{
+            "id": 31, "max_user_id": 123, "status": "completed",
+            "result_url": "https://cdn.example/31.png", "last_error": None,
+        }]
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        conn.execute.return_value.fetchall.return_value = pending
+        with patch.object(main, "db_connect", return_value=conn), \\
+             patch.object(main, "send_max", new=AsyncMock()) as send:
+            await main.deliver_generation_notifications()
+        send.assert_awaited_once()
+        self.assertEqual(conn.execute.call_count, 2)
+        self.assertIn("notification_sent_at=NOW()", conn.execute.call_args.args[0])
+
+    async def test_notification_remains_pending_when_max_delivery_fails(self):
+        pending = [{
+            "id": 32, "max_user_id": 123, "status": "completed",
+            "result_url": "https://cdn.example/32.png", "last_error": None,
+        }]
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        conn.execute.return_value.fetchall.return_value = pending
+        with patch.object(main, "db_connect", return_value=conn), \\
+             patch.object(main, "send_max", new=AsyncMock(side_effect=RuntimeError("MAX unavailable"))):
+            with self.assertRaisesRegex(RuntimeError, "MAX unavailable"):
+                await main.deliver_generation_notifications()
+        self.assertEqual(conn.execute.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
