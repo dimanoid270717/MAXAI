@@ -1,3 +1,4 @@
+import logging
 import os
 import secrets
 import ssl
@@ -23,7 +24,10 @@ from yookassa import (
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="1.2.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("neuropix")
+
+app = FastAPI(title="NEUROPIX AI bridge", version="1.2.1")
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
 
@@ -519,15 +523,34 @@ async def send_max(user_id: int, text: str, *, with_menu=False, keyboard=None):
                 json=payload,
             )
         if response.is_error:
+            logger.error(
+                "MAX send failed: status=%s body=%s",
+                response.status_code,
+                response.text[:1000],
+            )
             raise HTTPException(
                 status_code=502,
                 detail=f"MAX API вернул HTTP {response.status_code}",
             )
     except httpx.HTTPError as exc:
+        logger.exception("MAX send network error: %s", type(exc).__name__)
         raise HTTPException(
             status_code=502,
             detail=f"Ошибка соединения с MAX API: {type(exc).__name__}",
         ) from exc
+
+
+@app.middleware("http")
+async def log_unhandled_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception(
+            "Unhandled request error: method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+        raise
 
 
 @app.get("/health")
@@ -782,21 +805,45 @@ async def max_webhook(
             credits, amount = package
             payment_method = "sbp" if command == "оплатить по сбп" else "bank_card"
             order_code = create_pending_purchase_order(user_id, credits, amount)
-            payment_id, payment_url = await create_yookassa_payment(
-                order_code=order_code,
-                amount_rub=amount,
-                credits=credits,
-                payment_method=payment_method,
-            )
-            save_payment_id(required_env("DATABASE_URL"), order_code, payment_id)
-            clear_pending_payment_package(user_id)
-            method_label = "СБП" if payment_method == "sbp" else "банковской картой"
-            answer = (
-                f"Заказ №{order_code}\nПакет: {credits} кредитов — {amount} ₽.\n"
-                f"Способ оплаты: {method_label}.\n\n"
-                f"Перейди по ссылке для оплаты:\n{payment_url}\n\n"
-                "Кредиты будут начислены после подтверждения платежа."
-            )
+            try:
+                logger.info(
+                    "Payment creation started: order=%s method=%s amount=%s",
+                    order_code,
+                    payment_method,
+                    amount,
+                )
+                payment_id, payment_url = await create_yookassa_payment(
+                    order_code=order_code,
+                    amount_rub=amount,
+                    credits=credits,
+                    payment_method=payment_method,
+                )
+                save_payment_id(required_env("DATABASE_URL"), order_code, payment_id)
+                clear_pending_payment_package(user_id)
+                logger.info(
+                    "Payment created: order=%s provider_payment_id=%s",
+                    order_code,
+                    payment_id,
+                )
+                method_label = "СБП" if payment_method == "sbp" else "банковской картой"
+                answer = (
+                    f"Заказ №{order_code}\\nПакет: {credits} кредитов — {amount} ₽.\\n"
+                    f"Способ оплаты: {method_label}.\\n\\n"
+                    f"Перейди по ссылке для оплаты:\\n{payment_url}\\n\\n"
+                    "Кредиты будут начислены после подтверждения платежа."
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Payment creation failed: order=%s method=%s error_type=%s",
+                    order_code,
+                    payment_method,
+                    type(exc).__name__,
+                )
+                answer = (
+                    "Не удалось создать платёж. Деньги не списаны. "
+                    "Попробуй позже или обратись в поддержку. "
+                    f"Номер заказа: {order_code}."
+                )
     elif command == "мои заказы":
         # Сверяем ожидающие заказы напрямую с API ЮKassa на запрос пользователя.
         # Это подстраховывает случай, если HTTP-уведомление задержалось или потерялось.
