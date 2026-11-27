@@ -827,9 +827,9 @@ async def max_webhook(
                 )
                 method_label = "СБП" if payment_method == "sbp" else "банковской картой"
                 answer = (
-                    f"Заказ №{order_code}\\nПакет: {credits} кредитов — {amount} ₽.\\n"
-                    f"Способ оплаты: {method_label}.\\n\\n"
-                    f"Перейди по ссылке для оплаты:\\n{payment_url}\\n\\n"
+                    f"Заказ №{order_code}\nПакет: {credits} кредитов — {amount} ₽.\n"
+                    f"Способ оплаты: {method_label}.\n\n"
+                    f"Перейди по ссылке для оплаты:\n{payment_url}\n\n"
                     "Кредиты будут начислены после подтверждения платежа."
                 )
             except Exception as exc:
