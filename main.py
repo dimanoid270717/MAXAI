@@ -761,20 +761,22 @@ async def generation_poll_worker():
                 await refresh_generation(user_id, row)
                 with db_connect() as conn:
                     completed = conn.execute("""
-                        UPDATE generation_history SET notification_sent_at=NOW()
+                        SELECT status, result_url, last_error
+                        FROM generation_history
                         WHERE id=%s AND status IN ('completed','failed')
                           AND notification_sent_at IS NULL
-                        RETURNING status, result_url, last_error
                     """, (generation_id,)).fetchone()
                 if completed:
                     if completed["status"] == "completed":
-                        message = f"Генерация №{generation_id} готова!\nРезультат: {completed['result_url']}"
+                        message = f"Генерация №{generation_id} готова!\\nРезультат: {completed['result_url']}"
                     else:
                         message = f"Генерация №{generation_id} не удалась. Кредиты возвращены. {(completed['last_error'] or '')[:500]}"
-                    try:
-                        await send_max(user_id, message, with_menu=True)
-                    except Exception:
-                        logger.exception("MAX generation notification failed: generation_id=%s", generation_id)
+                    await send_max(user_id, message, with_menu=True)
+                    with db_connect() as conn:
+                        conn.execute("""
+                            UPDATE generation_history SET notification_sent_at=NOW()
+                            WHERE id=%s AND notification_sent_at IS NULL
+                        """, (generation_id,))
         except asyncio.CancelledError:
             raise
         except Exception:
