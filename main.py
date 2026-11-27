@@ -118,6 +118,22 @@ def initialize_database() -> None:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            conn.execute("""
+                ALTER TABLE user_sessions
+                ADD COLUMN IF NOT EXISTS reference_image_url TEXT
+            """)
+            conn.execute("""
+                ALTER TABLE user_sessions
+                ADD COLUMN IF NOT EXISTS reference_image_token TEXT
+            """)
+            conn.execute("""
+                ALTER TABLE generation_history
+                ADD COLUMN IF NOT EXISTS reference_image_url TEXT
+            """)
+            conn.execute("""
+                ALTER TABLE generation_history
+                ADD COLUMN IF NOT EXISTS reference_image_token TEXT
+            """)
         _db_initialized = True
     except HTTPException:
         raise
@@ -221,15 +237,17 @@ def get_user_state(user_id: int) -> str:
 
 def save_photo_draft(user_id: int, prompt: str) -> int:
     initialize_database()
+    image_url, image_token = get_photo_reference(user_id)
     with db_connect() as conn:
         row = conn.execute(
             """
             INSERT INTO generation_history
-                (max_user_id, generation_type, prompt, status)
-            VALUES (%s, 'image', %s, 'draft')
+                (max_user_id, generation_type, prompt, status,
+                 reference_image_url, reference_image_token)
+            VALUES (%s, 'image', %s, 'draft', %s, %s)
             RETURNING id
             """,
-            (user_id, prompt),
+            (user_id, prompt, image_url, image_token),
         ).fetchone()
     set_user_state(user_id, "waiting_photo_confirmation")
     return int(row["id"])
@@ -253,6 +271,11 @@ def confirm_latest_photo_draft(user_id: int) -> bool:
             (row["id"], user_id),
         )
     set_user_state(user_id, "idle")
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE user_sessions SET reference_image_url = NULL, reference_image_token = NULL WHERE max_user_id = %s",
+            (user_id,),
+        )
     return True
 
 
@@ -271,6 +294,39 @@ def cancel_latest_photo_draft(user_id: int) -> None:
             (user_id,),
         )
     set_user_state(user_id, "idle")
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE user_sessions SET reference_image_url = NULL, reference_image_token = NULL WHERE max_user_id = %s",
+            (user_id,),
+        )
+
+
+def save_photo_reference(user_id: int, image_url: str, image_token: str | None) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_sessions
+                (max_user_id, state, reference_image_url, reference_image_token)
+            VALUES (%s, 'waiting_photo_prompt', %s, %s)
+            ON CONFLICT (max_user_id) DO UPDATE SET
+                state = 'waiting_photo_prompt',
+                reference_image_url = EXCLUDED.reference_image_url,
+                reference_image_token = EXCLUDED.reference_image_token,
+                updated_at = NOW()
+            """,
+            (user_id, image_url, image_token),
+        )
+
+
+def get_photo_reference(user_id: int) -> tuple[str | None, str | None]:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT reference_image_url, reference_image_token FROM user_sessions WHERE max_user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return (row["reference_image_url"], row["reference_image_token"]) if row else (None, None)
 
 
 def max_ssl_context() -> ssl.SSLContext:
@@ -462,6 +518,36 @@ async def max_webhook(
         sender.get("first_name"),
     )
 
+    attachments = body.get("attachments") or message.get("attachments") or []
+    image_attachment = next(
+        (item for item in attachments if item.get("type") == "image"),
+        None,
+    )
+    if image_attachment:
+        image_payload = image_attachment.get("payload") or {}
+        image_url = image_payload.get("url")
+        image_token = image_payload.get("token")
+        if not image_url:
+            await send_max(
+                int(user_id),
+                "MAX прислал изображение без доступной ссылки. Попробуй отправить фото ещё раз.",
+                with_menu=True,
+            )
+            return {"ok": True}
+        save_photo_reference(
+            int(user_id),
+            str(image_url),
+            str(image_token) if image_token else None,
+        )
+        await send_max(
+            int(user_id),
+            "Фотография получена. Теперь напиши, что нужно сделать с изображением: "
+            "например, изменить фон, одежду или освещение. "
+            "Генерация пока не запускается, кредиты не расходуются.",
+            keyboard=message_keyboard([["Отменить"]]),
+        )
+        return {"ok": True}
+
     if not message_text:
         return {"ok": True}
 
@@ -478,10 +564,9 @@ async def max_webhook(
     elif command in ("создать фото", "фото"):
         set_user_state(int(user_id), "waiting_photo_prompt")
         answer = (
-            "Опиши, какое фото хочешь получить. Напиши подробный запрос одним сообщением: "
-            "кто или что должно быть на изображении, стиль, фон, одежда, освещение и формат. "
-            "Пока принимаем текстовое описание; загрузку фото-референса добавим следующим этапом. "
-            "Генерация не запустится и кредиты не спишутся."
+            "При желании сначала отправь фотографию, которую нужно использовать как референс. "
+            "Или сразу напиши текстовое описание изображения. Затем я покажу черновик для проверки. "
+            "Генерация пока отключена, кредиты не расходуются."
         )
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command in ("создать видео", "видео"):
