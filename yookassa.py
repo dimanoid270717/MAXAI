@@ -23,15 +23,19 @@ async def create_yookassa_payment(
     order_code: str,
     amount_rub: int,
     credits: int,
+    payment_method: str = "bank_card",
 ) -> tuple[str, str]:
     """Создаёт платёж и возвращает (payment_id, confirmation_url)."""
     shop_id, secret = _credentials()
+    if payment_method not in ("bank_card", "sbp"):
+        raise HTTPException(status_code=400, detail="Неподдерживаемый способ оплаты")
     payload = {
         "amount": {
             "value": f"{Decimal(amount_rub):.2f}",
             "currency": "RUB",
         },
         "capture": True,
+        "payment_method_data": {"type": payment_method},
         "confirmation": {
             "type": "redirect",
             "return_url": "https://maxai-tls6.onrender.com/payment/return",
