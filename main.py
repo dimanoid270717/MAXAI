@@ -13,7 +13,7 @@ from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.7.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.8.0")
 
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
@@ -592,10 +592,19 @@ def main_keyboard() -> list[list[dict]]:
     return message_keyboard([
         ["Создать фото", "Создать видео"],
         ["Каталог эффектов"],
-        ["Мой баланс", "Купить кредиты"],
-        ["История", "Поддержка"],
+        ["Тарифы", "Мой баланс"],
+        ["Купить кредиты", "История"],
+        ["Поддержка"],
     ])
 
+
+
+def credit_packages_keyboard() -> list[list[dict]]:
+    return message_keyboard([
+        ["100 кредитов — 100 ₽", "300 кредитов — 300 ₽"],
+        ["500 кредитов — 500 ₽", "1 000 кредитов — 1 000 ₽"],
+        ["Назад в меню"],
+    ])
 
 
 def effects_keyboard() -> list[list[dict]]:
@@ -864,6 +873,44 @@ async def max_webhook(
         set_user_state(int(user_id), "waiting_video_prompt")
         answer = "Эффект «Рекламный видеоролик» выбран. Опиши продукт, аудиторию, ключевую идею и сцену."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command in ("тарифы", "цены", "стоимость"):
+        answer = (
+            "ТАРИФЫ NEUROPIX\\n\\n"
+            "ФОТОГРАФИИ\\n"
+            "• 1K — 15 кредитов\\n"
+            "• 2K — 20 кредитов\\n"
+            "• 4K — 35 кредитов\\n\\n"
+            "ВИДЕО — 5 СЕКУНД\\n"
+            "• 480p — 149 кредитов\\n"
+            "• 720p — 299 кредитов\\n"
+            "• 1080p — временно недоступно\\n\\n"
+            "1 кредит = 1 рубль. Цены предварительные. "
+            "Оплата и запуск генерации пока отключены."
+        )
+        show_menu, keyboard = True, None
+    elif command == "купить кредиты":
+        answer = (
+            "ВЫБЕРИ ПАКЕТ КРЕДИТОВ\\n\\n"
+            "• 100 кредитов — 100 ₽\\n"
+            "• 300 кредитов — 300 ₽\\n"
+            "• 500 кредитов — 500 ₽\\n"
+            "• 1 000 кредитов — 1 000 ₽\\n\\n"
+            "Оплата пока не подключена. Выбор пакета ничего не покупает "
+            "и не списывает деньги."
+        )
+        show_menu, keyboard = False, credit_packages_keyboard()
+    elif command in (
+        "100 кредитов — 100 ₽",
+        "300 кредитов — 300 ₽",
+        "500 кредитов — 500 ₽",
+        "1 000 кредитов — 1 000 ₽",
+    ):
+        answer = (
+            f"Выбран пакет: {message_text}.\\n"
+            "Это пока предварительный выбор. Платёжная система ещё не подключена: "
+            "деньги не списаны, кредиты не начислены."
+        )
+        show_menu, keyboard = False, credit_packages_keyboard()
     elif command == "мой баланс":
         balance = get_user_balance(int(user_id))
         activity = get_credit_activity(int(user_id), limit=5)
@@ -883,9 +930,6 @@ async def max_webhook(
             f"{activity_text}\\n\\n"
             "Покупка и начисление кредитов пока не включены."
         )
-        show_menu, keyboard = True, None
-    elif command == "купить кредиты":
-        answer = "Покупка кредитов пока не подключена. Сначала настроим платёжный сервис и безопасное автоматическое начисление."
         show_menu, keyboard = True, None
     elif command == "история":
         history = get_user_history(int(user_id))
