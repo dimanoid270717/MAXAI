@@ -743,7 +743,7 @@ async def max_webhook(
             draft_id = save_video_draft(int(user_id), message_text[:30000])
             preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
             answer = (
-                f"Черновик видео №{draft_id}:\\n\\n{preview}\\n\\n"
+                f"Черновик видео №{draft_id}:\n\n{preview}\n\n"
                 "Подтверждение только сохранит запрос. Генерация пока не запускается, "
                 "кредиты не расходуются."
             )
