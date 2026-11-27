@@ -84,7 +84,33 @@ def max_headers() -> dict[str, str]:
     }
 
 
-async def send_max(user_id: int, text: str) -> None:
+def main_keyboard() -> list[list[dict]]:
+    # MAX inline keyboard buttons of type "message" send their text as a
+    # normal message, so the existing message_created webhook handles them.
+    return [
+        [{"type": "message", "text": "Создать фото"},
+         {"type": "message", "text": "Создать видео"}],
+        [{"type": "message", "text": "Каталог эффектов"}],
+        [{"type": "message", "text": "Мой баланс"},
+         {"type": "message", "text": "Купить кредиты"}],
+        [{"type": "message", "text": "История"},
+         {"type": "message", "text": "Поддержка"}],
+    ]
+
+
+async def send_max(
+    user_id: int,
+    text: str,
+    *,
+    with_menu: bool = False,
+) -> None:
+    payload = {"text": text[:4000]}
+    if with_menu:
+        payload["attachments"] = [{
+            "type": "inline_keyboard",
+            "payload": {"buttons": main_keyboard()},
+        }]
+
     try:
         async with httpx.AsyncClient(
             timeout=20,
@@ -94,7 +120,7 @@ async def send_max(user_id: int, text: str) -> None:
                 f"{MAX_API}/messages",
                 params={"user_id": user_id},
                 headers=max_headers(),
-                json={"text": text[:4000]},
+                json=payload,
             )
         if response.is_error:
             raise HTTPException(
@@ -176,8 +202,8 @@ async def max_webhook(
         if user_id:
             await send_max(
                 int(user_id),
-                "Добро пожаловать в NEUROPIX!\n"
-                "Создаю ИИ-фото и видео. Напиши /help.",
+                "Добро пожаловать в NEUROPIX!\nВыбери, что хочешь создать:",
+                with_menu=True,
             )
         return {"ok": True}
 
@@ -195,36 +221,66 @@ async def max_webhook(
 
     command = message_text.lower()
 
-    if command in ("/start", "старт", "начать"):
-        answer = (
-            "NEUROPIX — ИИ-фото и видео.\n\n"
-            "Напиши /help для инструкции."
-        )
+    if command in ("/start", "старт", "начать", "меню", "главное меню"):
+        answer = "NEUROPIX — создание ИИ-фото и видео. Выбери нужный раздел:"
+        show_menu = True
     elif command in ("/help", "помощь"):
         answer = (
-            "Отправь запрос в формате:\n"
-            "Фото: портрет в студии...\n"
-            "Видео: кинематографичная сцена...\n\n"
-            "Оплата, баланс и генерация прямо из чата "
-            "будут подключены отдельным этапом."
+            "Выбери раздел кнопками ниже.\n"
+            "Пока меню работает в тестовом режиме: генерации, баланс и оплата "
+            "ещё не подключены."
         )
+        show_menu = True
+    elif command in ("создать фото", "фото"):
+        answer = (
+            "Создание фото выбрано. Следующим этапом подключим загрузку "
+            "референса, ввод промпта и запуск Nano Banana 2.1. "
+            "Сейчас генерация отключена, кредиты не расходуются."
+        )
+        show_menu = True
+    elif command in ("создать видео", "видео"):
+        answer = (
+            "Создание видео выбрано. Следующим этапом подключим промпт, "
+            "референсы и параметры Seedance 2.5. "
+            "Сейчас генерация отключена, кредиты не расходуются."
+        )
+        show_menu = True
+    elif command == "каталог эффектов":
+        answer = (
+            "Каталог эффектов подготовим отдельно: кинематографичный портрет, "
+            "смена образа, оживление фото, рекламный ролик и другие шаблоны. "
+            "Пока это демонстрационный раздел."
+        )
+        show_menu = True
+    elif command == "мой баланс":
+        answer = "Баланс пока не подключён. Система учёта кредитов будет добавлена до запуска платных генераций."
+        show_menu = True
+    elif command == "купить кредиты":
+        answer = "Покупка кредитов пока не подключена. Сначала настроим платёжный сервис и автоматическое начисление."
+        show_menu = True
+    elif command == "история":
+        answer = "История генераций появится после подключения базы данных и самого процесса генерации."
+        show_menu = True
+    elif command == "поддержка":
+        answer = "Раздел поддержки готовится. Здесь появится способ связаться с администратором."
+        show_menu = True
     elif command.startswith(("фото:", "image:")):
         answer = (
-            "Запрос принят. Генерация и отправка готового "
-            "изображения в чат пока находятся в разработке."
+            "Запрос получил. Генерация пока отключена, поэтому кредиты не расходуются. "
+            "Скоро добавим полноценную форму создания фото."
         )
+        show_menu = True
     elif command.startswith(("видео:", "video:")):
         answer = (
-            "Запрос принят. Генерация и отправка готового "
-            "видео в чат пока находятся в разработке."
+            "Запрос получил. Генерация пока отключена, поэтому кредиты не расходуются. "
+            "Скоро добавим полноценную форму создания видео."
         )
+        show_menu = True
     else:
-        answer = (
-            "Я NEUROPIX — бот для ИИ-фото и видео. "
-            "Напиши /help."
-        )
+        answer = "Не понял команду. Выбери раздел кнопками меню ниже."
+        show_menu = True
 
-    await send_max(int(user_id), answer)
+    await send_max(int(user_id), answer, with_menu=show_menu)
     return {"ok": True}
 
 
