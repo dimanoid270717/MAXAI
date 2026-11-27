@@ -2,6 +2,9 @@
 name: Apply NEUROPIX patch
 
 on:
+  push:
+    branches:
+      - neuropix-2.0
   workflow_dispatch:
 
 permissions:
