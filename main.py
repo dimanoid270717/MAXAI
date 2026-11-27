@@ -80,6 +80,16 @@ def initialize_database():
         return
     with db_connect() as conn:
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_max_events (
+                event_key TEXT PRIMARY KEY,
+                processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS processed_max_events_processed_at_idx
+            ON processed_max_events(processed_at)
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 max_user_id BIGINT PRIMARY KEY,
                 username TEXT,
@@ -198,6 +208,31 @@ def initialize_database():
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ
         """)
     _db_initialized = True
+
+
+def max_event_key(update: dict) -> str | None:
+    """Stable key for MAX message_created webhook retries."""
+    if update.get("update_type") != "message_created":
+        return None
+    message = update.get("message") or {}
+    body = message.get("body") or {}
+    mid = body.get("mid") or message.get("mid")
+    if not mid:
+        return None
+    return f"max:message_created:{str(mid)}"
+
+
+def claim_max_event(event_key: str) -> bool:
+    """Atomically claim a webhook event; False means it was already processed."""
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute("""
+            INSERT INTO processed_max_events(event_key)
+            VALUES (%s)
+            ON CONFLICT(event_key) DO NOTHING
+            RETURNING event_key
+        """, (event_key,)).fetchone()
+    return bool(row)
 
 
 def save_user(user_id: int, username=None, first_name=None):
@@ -880,6 +915,10 @@ async def max_webhook(
         return {"ok": True}
 
     message = update.get("message") or {}
+    event_key = max_event_key(update)
+    if event_key and not claim_max_event(event_key):
+        return {"ok": True, "duplicate": True}
+
     sender = message.get("sender") or {}
     user_id = sender.get("user_id")
     body = message.get("body") or {}
