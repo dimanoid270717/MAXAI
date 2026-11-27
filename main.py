@@ -170,6 +170,12 @@ def initialize_database():
             ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS prompt_prefix TEXT
         """)
         conn.execute("""
+            ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS pending_payment_credits INTEGER
+        """)
+        conn.execute("""
+            ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS pending_payment_amount INTEGER
+        """)
+        conn.execute("""
             ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS reference_image_url TEXT
         """)
         conn.execute("""
@@ -237,6 +243,18 @@ def get_recent_purchase_orders(user_id: int, limit: int = 5):
         """, (user_id, limit)).fetchall()
 
 
+def get_awaiting_payment_records(user_id: int, limit: int = 10):
+    initialize_database()
+    with db_connect() as conn:
+        return conn.execute("""
+            SELECT order_code, provider_payment_id
+            FROM purchase_orders
+            WHERE max_user_id=%s AND status='awaiting_payment'
+              AND provider_payment_id IS NOT NULL
+            ORDER BY created_at DESC LIMIT %s
+        """, (user_id, limit)).fetchall()
+
+
 def get_user_history(user_id: int, limit: int = 5):
     initialize_database()
     with db_connect() as conn:
@@ -265,6 +283,45 @@ def get_user_state(user_id: int) -> str:
             "SELECT state FROM user_sessions WHERE max_user_id=%s", (user_id,)
         ).fetchone()
     return row["state"] if row else "idle"
+
+
+def save_pending_payment_package(user_id: int, credits: int, amount: int):
+    if credits not in (100, 300, 500, 1000) or amount != credits:
+        raise ValueError("Неизвестный пакет кредитов")
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO user_sessions
+                (max_user_id, state, pending_payment_credits, pending_payment_amount)
+            VALUES (%s, 'choosing_payment_method', %s, %s)
+            ON CONFLICT(max_user_id) DO UPDATE SET
+                state='choosing_payment_method',
+                pending_payment_credits=EXCLUDED.pending_payment_credits,
+                pending_payment_amount=EXCLUDED.pending_payment_amount,
+                updated_at=NOW()
+        """, (user_id, credits, amount))
+
+
+def get_pending_payment_package(user_id: int):
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute("""
+            SELECT pending_payment_credits, pending_payment_amount
+            FROM user_sessions WHERE max_user_id=%s
+        """, (user_id,)).fetchone()
+    if not row or not row["pending_payment_credits"] or not row["pending_payment_amount"]:
+        return None
+    return int(row["pending_payment_credits"]), int(row["pending_payment_amount"])
+
+
+def clear_pending_payment_package(user_id: int):
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute("""
+            UPDATE user_sessions SET pending_payment_credits=NULL,
+                pending_payment_amount=NULL, state='idle', updated_at=NOW()
+            WHERE max_user_id=%s
+        """, (user_id,))
 
 
 def set_prompt_prefix(user_id: int, prefix: str | None):
@@ -418,6 +475,13 @@ def credit_packages_keyboard():
     return message_keyboard([
         ["100 кредитов — 100 ₽", "300 кредитов — 300 ₽"],
         ["500 кредитов — 500 ₽", "1 000 кредитов — 1 000 ₽"],
+        ["Назад в меню"],
+    ])
+
+
+def payment_methods_keyboard():
+    return message_keyboard([
+        ["Оплатить картой", "Оплатить по СБП"],
         ["Назад в меню"],
     ])
 
@@ -707,19 +771,50 @@ async def max_webhook(
             "1 000 кредитов — 1 000 ₽": (1000, 1000),
         }
         credits, amount = packages[command]
-        order_code = create_pending_purchase_order(user_id, credits, amount)
-        payment_id, payment_url = await create_yookassa_payment(
-            order_code=order_code,
-            amount_rub=amount,
-            credits=credits,
-        )
-        save_payment_id(required_env("DATABASE_URL"), order_code, payment_id)
-        answer = (
-            f"Заказ №{order_code}\nПакет: {credits} кредитов — {amount} ₽.\n\n"
-            f"Перейди по ссылке для оплаты:\n{payment_url}\n\n"
-            "Кредиты будут начислены после подтверждения платежа."
-        )
+        save_pending_payment_package(user_id, credits, amount)
+        answer = f"Выбран пакет: {credits} кредитов за {amount} ₽.\n\nВыбери способ оплаты:"
+        show_menu, keyboard = False, payment_methods_keyboard()
+    elif command in ("оплатить картой", "оплатить по сбп"):
+        package = get_pending_payment_package(user_id)
+        if not package:
+            answer = "Сначала выбери пакет кредитов в разделе «Купить кредиты»."
+        else:
+            credits, amount = package
+            payment_method = "sbp" if command == "оплатить по сбп" else "bank_card"
+            order_code = create_pending_purchase_order(user_id, credits, amount)
+            payment_id, payment_url = await create_yookassa_payment(
+                order_code=order_code,
+                amount_rub=amount,
+                credits=credits,
+                payment_method=payment_method,
+            )
+            save_payment_id(required_env("DATABASE_URL"), order_code, payment_id)
+            clear_pending_payment_package(user_id)
+            method_label = "СБП" if payment_method == "sbp" else "банковской картой"
+            answer = (
+                f"Заказ №{order_code}\nПакет: {credits} кредитов — {amount} ₽.\n"
+                f"Способ оплаты: {method_label}.\n\n"
+                f"Перейди по ссылке для оплаты:\n{payment_url}\n\n"
+                "Кредиты будут начислены после подтверждения платежа."
+            )
     elif command == "мои заказы":
+        # Сверяем ожидающие заказы напрямую с API ЮKassa на запрос пользователя.
+        # Это подстраховывает случай, если HTTP-уведомление задержалось или потерялось.
+        for pending in get_awaiting_payment_records(user_id):
+            try:
+                payment = await fetch_yookassa_payment(str(pending["provider_payment_id"]))
+                if payment.get("status") == "succeeded":
+                    credited = credit_paid_order(required_env("DATABASE_URL"), payment)
+                    if credited:
+                        await send_max(
+                            user_id,
+                            f"Оплата получена! Начислено {payment.get('metadata', {}).get('credits', 'положенное количество')} кредитов.",
+                        )
+                elif payment.get("status") == "canceled":
+                    mark_payment_cancelled(required_env("DATABASE_URL"), payment)
+            except HTTPException:
+                # Ошибка сверки не должна ломать показ списка заказов.
+                pass
         orders = get_recent_purchase_orders(user_id)
         if orders:
             names = {
