@@ -92,6 +92,14 @@ def initialize_database():
             ON processed_max_events(processed_at)
         """)
         conn.execute("""
+            ALTER TABLE processed_max_events
+            ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'processed'
+        """)
+        conn.execute("""
+            ALTER TABLE processed_max_events
+            ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 max_user_id BIGINT PRIMARY KEY,
                 username TEXT,
