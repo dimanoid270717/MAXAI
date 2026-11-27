@@ -312,3 +312,21 @@ def credit_paid_order(database_url: str, payment: dict) -> bool:
             (int(order["id"]),),
         )
         return True
+
+
+async def fetch_yookassa_refund(refund_id: str) -> dict:
+    """Получает актуальный возврат напрямую из API ЮKassa."""
+    shop_id, secret = _credentials()
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.get(
+                f"{YOOKASSA_API}/refunds/{refund_id}",
+                auth=(shop_id, secret),
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось проверить возврат в ЮKassa",
+        ) from exc
