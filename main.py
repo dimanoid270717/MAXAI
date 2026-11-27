@@ -13,7 +13,7 @@ from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.5.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.6.0")
 
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
@@ -127,6 +127,10 @@ def initialize_database() -> None:
                 ADD COLUMN IF NOT EXISTS reference_image_token TEXT
             """)
             conn.execute("""
+                ALTER TABLE user_sessions
+                ADD COLUMN IF NOT EXISTS prompt_prefix TEXT
+            """)
+            conn.execute("""
                 ALTER TABLE generation_history
                 ADD COLUMN IF NOT EXISTS reference_image_url TEXT
             """)
@@ -235,6 +239,31 @@ def get_user_state(user_id: int) -> str:
             (user_id,),
         ).fetchone()
     return row["state"] if row else "idle"
+
+
+def set_prompt_prefix(user_id: int, prefix: str | None) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_sessions (max_user_id, state, prompt_prefix)
+            VALUES (%s, 'idle', %s)
+            ON CONFLICT (max_user_id) DO UPDATE SET
+                prompt_prefix = EXCLUDED.prompt_prefix,
+                updated_at = NOW()
+            """,
+            (user_id, prefix),
+        )
+
+
+def get_prompt_prefix(user_id: int) -> str:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT prompt_prefix FROM user_sessions WHERE max_user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return (row["prompt_prefix"] or "") if row else ""
 
 
 def save_photo_draft(user_id: int, prompt: str) -> int:
@@ -453,6 +482,16 @@ def main_keyboard() -> list[list[dict]]:
     ])
 
 
+
+def effects_keyboard() -> list[list[dict]]:
+    return message_keyboard([
+        ["Кинопортрет", "Смена фона"],
+        ["Фото товара", "Ретро-фото"],
+        ["Видео автомобиля", "Рекламное видео"],
+        ["Назад в меню"],
+    ])
+
+
 def photo_confirmation_keyboard() -> list[list[dict]]:
     return message_keyboard([
         ["Подтвердить запрос"],
@@ -655,6 +694,7 @@ async def max_webhook(
         answer = "Выбери раздел кнопками ниже. Подготовка запроса на фото доступна, запуск генерации и оплата пока отключены."
         show_menu, keyboard = True, None
     elif command in ("создать фото", "фото"):
+        set_prompt_prefix(int(user_id), None)
         set_user_state(int(user_id), "waiting_photo_prompt")
         answer = (
             "При желании сначала отправь фотографию, которую нужно использовать как референс. "
@@ -663,6 +703,7 @@ async def max_webhook(
         )
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command in ("создать видео", "видео"):
+        set_prompt_prefix(int(user_id), None)
         set_user_state(int(user_id), "waiting_video_prompt")
         answer = (
             "Опиши видео одним сообщением: что происходит в кадре, движение камеры, "
@@ -671,8 +712,42 @@ async def max_webhook(
         )
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command == "каталог эффектов":
-        answer = "Каталог эффектов готовится: кинематографичный портрет, смена образа, оживление фото, рекламный ролик и другие шаблоны."
+        answer = "Выбери готовый эффект. После выбора добавь свои детали — бот соберёт черновик запроса."
+        show_menu, keyboard = False, effects_keyboard()
+    elif command == "назад в меню":
+        set_user_state(int(user_id), "idle")
+        answer = "Главное меню NEUROPIX:"
         show_menu, keyboard = True, None
+    elif command == "кинопортрет":
+        set_prompt_prefix(int(user_id), "Кинематографичный фотореалистичный портрет, профессиональная постановка света, естественная кожа, выразительная композиция. Детали пользователя: ")
+        set_user_state(int(user_id), "waiting_photo_prompt")
+        answer = "Эффект «Кинопортрет» выбран. Напиши, кто должен быть на фото, одежду, фон и настроение."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command == "смена фона":
+        set_prompt_prefix(int(user_id), "Фотореалистичная замена фона. Сохранить главного человека и его внешность без изменений, естественно согласовать перспективу, свет и тени. Новый фон и детали: ")
+        set_user_state(int(user_id), "waiting_photo_prompt")
+        answer = "Эффект «Смена фона» выбран. Опиши новый фон и желаемую атмосферу. При желании прикрепи фото-референс."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command == "фото товара":
+        set_prompt_prefix(int(user_id), "Профессиональная рекламная предметная фотография товара, чистая композиция, контролируемое студийное освещение, высокая детализация. Товар и пожелания: ")
+        set_user_state(int(user_id), "waiting_photo_prompt")
+        answer = "Эффект «Фото товара» выбран. Опиши товар, фон и стиль рекламы."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command == "ретро-фото":
+        set_prompt_prefix(int(user_id), "Ретро-фотография с достоверной аналоговой фактурой, естественными цветами, мягким зерном и характером плёночной съёмки. Сюжет и эпоха: ")
+        set_user_state(int(user_id), "waiting_photo_prompt")
+        answer = "Эффект «Ретро-фото» выбран. Опиши сюжет и эпоху, которую нужно передать."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command == "видео автомобиля":
+        set_prompt_prefix(int(user_id), "Кинематографичный автомобильный ролик, плавное движение камеры, реалистичная физика движения, выразительный свет и детальная окружающая среда. Автомобиль и сцена: ")
+        set_user_state(int(user_id), "waiting_video_prompt")
+        answer = "Эффект «Видео автомобиля» выбран. Опиши машину, локацию, движение и длительность."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
+    elif command == "рекламное видео":
+        set_prompt_prefix(int(user_id), "Профессиональный рекламный видеоролик, выразительные планы, плавная камера, акцент на преимуществах продукта, коммерческое качество. Продукт и сценарий: ")
+        set_user_state(int(user_id), "waiting_video_prompt")
+        answer = "Эффект «Рекламное видео» выбран. Опиши продукт, аудиторию, ключевую идею и сцену."
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command == "мой баланс":
         balance = get_user_balance(int(user_id))
         answer = f"Твой баланс: {balance} кредитов. Покупка и начисление кредитов пока не включены."
@@ -704,6 +779,7 @@ async def max_webhook(
         answer = "По вопросам работы NEUROPIX контакт поддержки будет добавлен перед запуском."
         show_menu, keyboard = True, None
     elif command in ("отменить", "отмена"):
+        set_prompt_prefix(int(user_id), None)
         cancel_latest_draft(int(user_id))
         answer = "Подготовка запроса отменена. Выбери следующий раздел:"
         show_menu, keyboard = True, None
@@ -740,8 +816,11 @@ async def max_webhook(
             answer = "Добавь деталей: что происходит в видео, как движется камера и сколько длится сцена."
             show_menu, keyboard = False, message_keyboard([["Отменить"]])
         else:
-            draft_id = save_video_draft(int(user_id), message_text[:30000])
-            preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
+            prefix = get_prompt_prefix(int(user_id))
+            final_prompt = (prefix + message_text).strip()[:30000]
+            draft_id = save_video_draft(int(user_id), final_prompt)
+            set_prompt_prefix(int(user_id), None)
+            preview = final_prompt if len(final_prompt) <= 1200 else final_prompt[:1200] + "…"
             answer = (
                 f"Черновик видео №{draft_id}:\n\n{preview}\n\n"
                 "Подтверждение только сохранит запрос. Генерация пока не запускается, "
@@ -756,8 +835,11 @@ async def max_webhook(
             answer = "Добавь немного деталей — описание слишком короткое. Напиши, что именно должно быть на фото."
             show_menu, keyboard = False, message_keyboard([["Отменить"]])
         else:
-            draft_id = save_photo_draft(int(user_id), message_text[:20000])
-            preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
+            prefix = get_prompt_prefix(int(user_id))
+            final_prompt = (prefix + message_text).strip()[:20000]
+            draft_id = save_photo_draft(int(user_id), final_prompt)
+            set_prompt_prefix(int(user_id), None)
+            preview = final_prompt if len(final_prompt) <= 1200 else final_prompt[:1200] + "…"
             reference_url, _ = get_photo_reference(int(user_id))
             reference_note = (
                 "Фотография-референс прикреплена.\\n\\n"
