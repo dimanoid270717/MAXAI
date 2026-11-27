@@ -103,5 +103,30 @@ class TestGenerationSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.execute.call_count, 1)
 
 
+    async def test_gen202_server_error_keeps_credits_reserved(self):
+        row = {"id": 41, "generation_type": "image", "prompt": "test",
+               "resolution": "1K", "reference_image_url": None}
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        with patch.object(main, "generation_enabled", return_value=True), patch.object(main, "debit_generation", return_value=(True, "ok")), patch.object(main, "Gen202Client") as provider, patch.object(main, "db_connect", return_value=conn), patch.object(main, "refund_generation") as refund:
+            provider.return_value.create_image = AsyncMock(side_effect=main.Gen202Error("upstream error", status_code=500))
+            ok, message = await main.launch_generation(123, row)
+        self.assertFalse(ok)
+        self.assertIn("неоднозначен", message)
+        refund.assert_not_called()
+        self.assertIn("status='submission_unknown'", conn.execute.call_args.args[0])
+
+    async def test_gen202_validation_error_refunds_credits(self):
+        row = {"id": 42, "generation_type": "image", "prompt": "test",
+               "resolution": "1K", "reference_image_url": None}
+        with patch.object(main, "generation_enabled", return_value=True), patch.object(main, "debit_generation", return_value=(True, "ok")), patch.object(main, "Gen202Client") as provider, patch.object(main, "refund_generation", return_value=True) as refund:
+            provider.return_value.create_image = AsyncMock(side_effect=main.Gen202Error("invalid model", status_code=422))
+            ok, message = await main.launch_generation(123, row)
+        self.assertFalse(ok)
+        self.assertIn("Кредиты возвращены", message)
+        refund.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
