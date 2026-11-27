@@ -13,7 +13,7 @@ from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.4.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.5.0")
 
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
@@ -192,7 +192,9 @@ def get_user_history(user_id: int, limit: int = 5) -> list[dict]:
         with db_connect() as conn:
             rows = conn.execute(
                 """
-                SELECT generation_type, status, created_at
+                SELECT generation_type, status, prompt,
+                       (reference_image_url IS NOT NULL) AS has_reference,
+                       created_at
                 FROM generation_history
                 WHERE max_user_id = %s
                 ORDER BY created_at DESC
@@ -251,6 +253,89 @@ def save_photo_draft(user_id: int, prompt: str) -> int:
         ).fetchone()
     set_user_state(user_id, "waiting_photo_confirmation")
     return int(row["id"])
+
+
+def save_video_draft(user_id: int, prompt: str) -> int:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO generation_history
+                (max_user_id, generation_type, prompt, status)
+            VALUES (%s, 'video', %s, 'draft')
+            RETURNING id
+            """,
+            (user_id, prompt),
+        ).fetchone()
+    set_user_state(user_id, "waiting_video_confirmation")
+    return int(row["id"])
+
+
+def confirm_latest_draft(user_id: int) -> tuple[bool, str | None]:
+    initialize_database()
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, generation_type
+            FROM generation_history
+            WHERE max_user_id = %s
+              AND generation_type IN ('image', 'video')
+              AND status = 'draft'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return False, None
+        conn.execute(
+            """
+            UPDATE generation_history
+            SET status = 'ready_for_generation'
+            WHERE id = %s AND max_user_id = %s
+            """,
+            (row["id"], user_id),
+        )
+        if row["generation_type"] == "image":
+            conn.execute(
+                """
+                UPDATE user_sessions
+                SET reference_image_url = NULL, reference_image_token = NULL
+                WHERE max_user_id = %s
+                """,
+                (user_id,),
+            )
+    set_user_state(user_id, "idle")
+    return True, row["generation_type"]
+
+
+def cancel_latest_draft(user_id: int) -> None:
+    initialize_database()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE generation_history
+            SET status = 'cancelled'
+            WHERE id = (
+                SELECT id FROM generation_history
+                WHERE max_user_id = %s
+                  AND generation_type IN ('image', 'video')
+                  AND status = 'draft'
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            """,
+            (user_id,),
+        )
+        conn.execute(
+            """
+            UPDATE user_sessions
+            SET reference_image_url = NULL, reference_image_token = NULL
+            WHERE max_user_id = %s
+            """,
+            (user_id,),
+        )
+    set_user_state(user_id, "idle")
 
 
 def confirm_latest_photo_draft(user_id: int) -> bool:
@@ -369,6 +454,14 @@ def main_keyboard() -> list[list[dict]]:
 
 
 def photo_confirmation_keyboard() -> list[list[dict]]:
+    return message_keyboard([
+        ["Подтвердить запрос"],
+        ["Изменить описание", "Отменить"],
+    ])
+
+
+
+def video_confirmation_keyboard() -> list[list[dict]]:
     return message_keyboard([
         ["Подтвердить запрос"],
         ["Изменить описание", "Отменить"],
@@ -570,8 +663,13 @@ async def max_webhook(
         )
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command in ("создать видео", "видео"):
-        answer = "Создание видео пока находится в разработке. Выбери «Создать фото» или вернись в главное меню."
-        show_menu, keyboard = True, None
+        set_user_state(int(user_id), "waiting_video_prompt")
+        answer = (
+            "Опиши видео одним сообщением: что происходит в кадре, движение камеры, "
+            "персонажи, окружение, стиль и длительность. "
+            "Пока сохраняем только черновик — генерация и списание кредитов отключены."
+        )
+        show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command == "каталог эффектов":
         answer = "Каталог эффектов готовится: кинематографичный портрет, смена образа, оживление фото, рекламный ролик и другие шаблоны."
         show_menu, keyboard = True, None
@@ -587,33 +685,72 @@ async def max_webhook(
         if not history:
             answer = "История пока пустая. Здесь будут отображаться твои генерации и подготовленные запросы."
         else:
-            lines = [
-                f"• {item['generation_type']} — {item['status']} "
-                f"({item['created_at'].astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')})"
-                for item in history
-            ]
+            lines = []
+            for item in history:
+                kind = "фото" if item["generation_type"] == "image" else "видео"
+                prompt = (item.get("prompt") or "").strip().replace("\\n", " ")
+                prompt_short = (prompt[:90] + "…") if len(prompt) > 90 else prompt
+                reference = " · с референсом" if item.get("has_reference") else ""
+                line = (
+                    f"• {kind} — {item['status']}{reference} "
+                    f"({item['created_at'].astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')})"
+                )
+                if prompt_short:
+                    line += f"\\n  {prompt_short}"
+                lines.append(line)
             answer = "Последние операции:\n" + "\n".join(lines)
         show_menu, keyboard = True, None
     elif command == "поддержка":
         answer = "По вопросам работы NEUROPIX контакт поддержки будет добавлен перед запуском."
         show_menu, keyboard = True, None
     elif command in ("отменить", "отмена"):
-        cancel_latest_photo_draft(int(user_id))
+        cancel_latest_draft(int(user_id))
         answer = "Подготовка запроса отменена. Выбери следующий раздел:"
         show_menu, keyboard = True, None
     elif command in ("изменить описание", "изменить"):
-        set_user_state(int(user_id), "waiting_photo_prompt")
-        answer = "Напиши новое описание изображения."
+        with db_connect() as conn:
+            pending = conn.execute(
+                """
+                SELECT generation_type FROM generation_history
+                WHERE max_user_id = %s AND status = 'draft'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (int(user_id),),
+            ).fetchone()
+        if pending and pending["generation_type"] == "video":
+            set_user_state(int(user_id), "waiting_video_prompt")
+            answer = "Напиши новое описание видео."
+        else:
+            set_user_state(int(user_id), "waiting_photo_prompt")
+            answer = "Напиши новое описание фото."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command in ("подтвердить запрос", "подтвердить"):
-        if confirm_latest_photo_draft(int(user_id)):
+        confirmed, generation_type = confirm_latest_draft(int(user_id))
+        if confirmed:
+            kind = "фото" if generation_type == "image" else "видео"
             answer = (
-                "Запрос сохранён и готов к следующему этапу. Сама генерация пока отключена: "
-                "кредиты не списаны, задача в GEN202 не создавалась."
+                f"Черновик {kind} сохранён и готов к следующему этапу. "
+                "Генерация пока отключена: кредиты не списаны, задача в GEN202 не создавалась."
             )
         else:
             answer = "Нет подготовленного запроса для подтверждения."
         show_menu, keyboard = True, None
+    elif current_state == "waiting_video_prompt":
+        if len(message_text) < 5:
+            answer = "Добавь деталей: что происходит в видео, как движется камера и сколько длится сцена."
+            show_menu, keyboard = False, message_keyboard([["Отменить"]])
+        else:
+            draft_id = save_video_draft(int(user_id), message_text[:30000])
+            preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
+            answer = (
+                f"Черновик видео №{draft_id}:\\n\\n{preview}\\n\\n"
+                "Подтверждение только сохранит запрос. Генерация пока не запускается, "
+                "кредиты не расходуются."
+            )
+            show_menu, keyboard = False, video_confirmation_keyboard()
+    elif current_state == "waiting_video_confirmation":
+        answer = "Сначала подтверди подготовленный запрос, измени описание или отмени его."
+        show_menu, keyboard = False, video_confirmation_keyboard()
     elif current_state == "waiting_photo_prompt":
         if len(message_text) < 5:
             answer = "Добавь немного деталей — описание слишком короткое. Напиши, что именно должно быть на фото."
@@ -621,8 +758,14 @@ async def max_webhook(
         else:
             draft_id = save_photo_draft(int(user_id), message_text[:20000])
             preview = message_text if len(message_text) <= 1200 else message_text[:1200] + "…"
+            reference_url, _ = get_photo_reference(int(user_id))
+            reference_note = (
+                "Фотография-референс прикреплена.\\n\\n"
+                if reference_url
+                else "Фотография-референс не прикреплена.\\n\\n"
+            )
             answer = (
-                f"Черновик запроса №{draft_id}:\n\n{preview}\n\n"
+                f"Черновик запроса №{draft_id}:\\n\\n{reference_note}{preview}\\n\\n"
                 "Проверь описание. Подтверждение только сохранит запрос для следующего этапа. "
                 "Генерация пока не запускается и кредиты не расходуются."
             )
