@@ -4,6 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 import psycopg
+from psycopg.rows import dict_row
 from fastapi import HTTPException
 
 YOOKASSA_API = "https://api.yookassa.ru/v3"
@@ -92,7 +93,7 @@ async def fetch_yookassa_payment(payment_id: str) -> dict:
 
 
 def save_payment_id(database_url: str, order_code: str, payment_id: str) -> None:
-    with psycopg.connect(database_url) as conn:
+    with psycopg.connect(database_url, row_factory=dict_row) as conn:
         row = conn.execute(
             """
             UPDATE purchase_orders
@@ -130,7 +131,7 @@ def credit_paid_order(database_url: str, payment: dict) -> bool:
     if (payment.get("amount") or {}).get("currency") != "RUB":
         return False
 
-    with psycopg.connect(database_url) as conn:
+    with psycopg.connect(database_url, row_factory=dict_row) as conn:
         order = conn.execute(
             """
             SELECT id, max_user_id, package_credits, amount_rub,
