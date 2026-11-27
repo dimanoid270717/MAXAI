@@ -23,7 +23,7 @@ from yookassa import (
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="1.1.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="1.2.0")
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
 
