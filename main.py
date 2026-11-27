@@ -13,7 +13,7 @@ from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.6.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.7.0")
 
 MAX_API = "https://platform-api2.max.ru"
 _db_initialized = False
@@ -98,6 +98,16 @@ def initialize_database() -> None:
                     reason TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+            """)
+            conn.execute("""
+                ALTER TABLE credit_transactions
+                ADD COLUMN IF NOT EXISTS idempotency_key TEXT
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                credit_transactions_idempotency_key_unique
+                ON credit_transactions (idempotency_key)
+                WHERE idempotency_key IS NOT NULL
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS generation_history (
@@ -187,6 +197,111 @@ def get_user_balance(user_id: int) -> int:
         raise HTTPException(
             status_code=503,
             detail=f"Could not read balance: {type(exc).__name__}",
+        ) from exc
+
+
+def apply_credit_change(
+    user_id: int,
+    amount: int,
+    reason: str,
+    idempotency_key: str,
+) -> int:
+    """
+    Atomically change a user's balance and record the ledger entry.
+    A repeated idempotency key never applies the same change twice.
+    This function is groundwork only; no payment or generation flow calls it yet.
+    """
+    if amount == 0:
+        raise ValueError("Credit change amount cannot be zero")
+    if not idempotency_key or len(idempotency_key) > 200:
+        raise ValueError("A valid idempotency key is required")
+
+    initialize_database()
+    try:
+        with db_connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT max_user_id
+                FROM credit_transactions
+                WHERE idempotency_key = %s
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                row = conn.execute(
+                    "SELECT balance FROM users WHERE max_user_id = %s",
+                    (user_id,),
+                ).fetchone()
+                return int(row["balance"]) if row else 0
+
+            conn.execute(
+                """
+                INSERT INTO users (max_user_id)
+                VALUES (%s)
+                ON CONFLICT (max_user_id) DO NOTHING
+                """,
+                (user_id,),
+            )
+            row = conn.execute(
+                """
+                UPDATE users
+                SET balance = balance + %s,
+                    last_seen_at = NOW()
+                WHERE max_user_id = %s
+                  AND balance + %s >= 0
+                RETURNING balance
+                """,
+                (amount, user_id, amount),
+            ).fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Insufficient credits for this operation",
+                )
+
+            conn.execute(
+                """
+                INSERT INTO credit_transactions
+                    (max_user_id, amount, reason, idempotency_key)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (user_id, amount, reason[:300], idempotency_key),
+            )
+            return int(row["balance"])
+    except HTTPException:
+        raise
+    except psycopg.errors.UniqueViolation:
+        # Concurrent duplicate request: return the current balance without
+        # applying the credit change again.
+        return get_user_balance(user_id)
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not update credit ledger: {type(exc).__name__}",
+        ) from exc
+
+
+def get_credit_activity(user_id: int, limit: int = 5) -> list[dict]:
+    initialize_database()
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT amount, reason, created_at
+                FROM credit_transactions
+                WHERE max_user_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            ).fetchall()
+        return rows
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not read credit activity: {type(exc).__name__}",
         ) from exc
 
 
@@ -485,9 +600,9 @@ def main_keyboard() -> list[list[dict]]:
 
 def effects_keyboard() -> list[list[dict]]:
     return message_keyboard([
-        ["Кинопортрет", "Смена фона"],
-        ["Фото товара", "Ретро-фото"],
-        ["Видео автомобиля", "Рекламное видео"],
+        ["Кинематографичный портрет", "Замена фона"],
+        ["Рекламное фото товара", "Фото в стиле ретро"],
+        ["Автомобильное видео", "Рекламный видеоролик"],
         ["Назад в меню"],
     ])
 
@@ -556,6 +671,7 @@ async def health():
     return {
         "ok": True,
         "service": "NEUROPIX AI bridge",
+        "version": app.version,
         "database": database_status,
     }
 
@@ -718,39 +834,55 @@ async def max_webhook(
         set_user_state(int(user_id), "idle")
         answer = "Главное меню NEUROPIX:"
         show_menu, keyboard = True, None
-    elif command == "кинопортрет":
+    elif command == "кинематографичный портрет":
         set_prompt_prefix(int(user_id), "Кинематографичный фотореалистичный портрет, профессиональная постановка света, естественная кожа, выразительная композиция. Детали пользователя: ")
         set_user_state(int(user_id), "waiting_photo_prompt")
-        answer = "Эффект «Кинопортрет» выбран. Напиши, кто должен быть на фото, одежду, фон и настроение."
+        answer = "Эффект «Кинематографичный портрет» выбран. Напиши, кто должен быть на фото, одежду, фон и настроение."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
-    elif command == "смена фона":
+    elif command == "замена фона":
         set_prompt_prefix(int(user_id), "Фотореалистичная замена фона. Сохранить главного человека и его внешность без изменений, естественно согласовать перспективу, свет и тени. Новый фон и детали: ")
         set_user_state(int(user_id), "waiting_photo_prompt")
-        answer = "Эффект «Смена фона» выбран. Опиши новый фон и желаемую атмосферу. При желании прикрепи фото-референс."
+        answer = "Эффект «Замена фона» выбран. Опиши новый фон и желаемую атмосферу. При желании прикрепи фото-референс."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
-    elif command == "фото товара":
+    elif command == "рекламное фото товара":
         set_prompt_prefix(int(user_id), "Профессиональная рекламная предметная фотография товара, чистая композиция, контролируемое студийное освещение, высокая детализация. Товар и пожелания: ")
         set_user_state(int(user_id), "waiting_photo_prompt")
-        answer = "Эффект «Фото товара» выбран. Опиши товар, фон и стиль рекламы."
+        answer = "Эффект «Рекламное фото товара» выбран. Опиши товар, фон и стиль рекламы."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
-    elif command == "ретро-фото":
+    elif command == "фото в стиле ретро":
         set_prompt_prefix(int(user_id), "Ретро-фотография с достоверной аналоговой фактурой, естественными цветами, мягким зерном и характером плёночной съёмки. Сюжет и эпоха: ")
         set_user_state(int(user_id), "waiting_photo_prompt")
-        answer = "Эффект «Ретро-фото» выбран. Опиши сюжет и эпоху, которую нужно передать."
+        answer = "Эффект «Фото в стиле ретро» выбран. Опиши сюжет и эпоху, которую нужно передать."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
-    elif command == "видео автомобиля":
+    elif command == "автомобильное видео":
         set_prompt_prefix(int(user_id), "Кинематографичный автомобильный ролик, плавное движение камеры, реалистичная физика движения, выразительный свет и детальная окружающая среда. Автомобиль и сцена: ")
         set_user_state(int(user_id), "waiting_video_prompt")
-        answer = "Эффект «Видео автомобиля» выбран. Опиши машину, локацию, движение и длительность."
+        answer = "Эффект «Автомобильное видео» выбран. Опиши машину, локацию, движение и длительность."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
-    elif command == "рекламное видео":
+    elif command == "рекламный видеоролик":
         set_prompt_prefix(int(user_id), "Профессиональный рекламный видеоролик, выразительные планы, плавная камера, акцент на преимуществах продукта, коммерческое качество. Продукт и сценарий: ")
         set_user_state(int(user_id), "waiting_video_prompt")
-        answer = "Эффект «Рекламное видео» выбран. Опиши продукт, аудиторию, ключевую идею и сцену."
+        answer = "Эффект «Рекламный видеоролик» выбран. Опиши продукт, аудиторию, ключевую идею и сцену."
         show_menu, keyboard = False, message_keyboard([["Отменить"]])
     elif command == "мой баланс":
         balance = get_user_balance(int(user_id))
-        answer = f"Твой баланс: {balance} кредитов. Покупка и начисление кредитов пока не включены."
+        activity = get_credit_activity(int(user_id), limit=5)
+        if activity:
+            activity_lines = []
+            for item in activity:
+                sign = "+" if int(item["amount"]) > 0 else ""
+                when = item["created_at"].astimezone(timezone.utc).strftime("%d.%m %H:%M UTC")
+                activity_lines.append(
+                    f"• {sign}{item['amount']} — {item['reason']} ({when})"
+                )
+            activity_text = "\\nПоследние операции:\\n" + "\\n".join(activity_lines)
+        else:
+            activity_text = "\\nОпераций пока нет."
+        answer = (
+            f"Твой баланс: {balance} кредитов."
+            f"{activity_text}\\n\\n"
+            "Покупка и начисление кредитов пока не включены."
+        )
         show_menu, keyboard = True, None
     elif command == "купить кредиты":
         answer = "Покупка кредитов пока не подключена. Сначала настроим платёжный сервис и безопасное автоматическое начисление."
