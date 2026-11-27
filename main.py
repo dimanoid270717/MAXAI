@@ -1,18 +1,22 @@
 import os
 import ssl
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel, Field, HttpUrl
 import httpx
+import psycopg
+from psycopg.rows import dict_row
 
 from gen202 import Gen202Client, Gen202Error
 
 load_dotenv()
 
-app = FastAPI(title="NEUROPIX AI bridge", version="0.3.0")
+app = FastAPI(title="NEUROPIX AI bridge", version="0.4.0")
 
-# MAX Bot API. SSL verification remains enabled.
 MAX_API = "https://platform-api2.max.ru"
+_db_initialized = False
 
 
 class ImageRequest(BaseModel):
@@ -53,12 +57,137 @@ def required_env(name: str) -> str:
     return value
 
 
+def db_connect():
+    database_url = required_env("DATABASE_URL")
+    try:
+        return psycopg.connect(
+            database_url,
+            connect_timeout=12,
+            row_factory=dict_row,
+        )
+    except psycopg.Error as exc:
+        # Do not return the connection string or credentials to the caller.
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database connection failed: {type(exc).__name__}",
+        ) from exc
+
+
+def initialize_database() -> None:
+    global _db_initialized
+    if _db_initialized:
+        return
+
+    try:
+        with db_connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    max_user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS credit_transactions (
+                    id BIGSERIAL PRIMARY KEY,
+                    max_user_id BIGINT NOT NULL REFERENCES users(max_user_id),
+                    amount INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS generation_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    max_user_id BIGINT NOT NULL REFERENCES users(max_user_id),
+                    generation_type TEXT NOT NULL,
+                    prompt TEXT,
+                    status TEXT NOT NULL DEFAULT 'created',
+                    provider_task_id TEXT,
+                    result_url TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        _db_initialized = True
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database initialization failed: {type(exc).__name__}",
+        ) from exc
+
+
+def save_user(user_id: int, username: str | None, first_name: str | None) -> None:
+    initialize_database()
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (max_user_id, username, first_name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (max_user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_seen_at = NOW()
+                """,
+                (user_id, username, first_name),
+            )
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not save user: {type(exc).__name__}",
+        ) from exc
+
+
+def get_user_balance(user_id: int) -> int:
+    initialize_database()
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT balance FROM users WHERE max_user_id = %s",
+                (user_id,),
+            ).fetchone()
+        return int(row["balance"]) if row else 0
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not read balance: {type(exc).__name__}",
+        ) from exc
+
+
+def get_user_history(user_id: int, limit: int = 5) -> list[dict]:
+    initialize_database()
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT generation_type, status, created_at
+                FROM generation_history
+                WHERE max_user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            ).fetchall()
+        return rows
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not read history: {type(exc).__name__}",
+        ) from exc
+
+
 def max_ssl_context() -> ssl.SSLContext:
-    """
-    Use the normal system trust store plus the additional MAX trusted root
-    certificate uploaded to Render Secret Files. Certificate verification
-    and hostname verification remain enabled.
-    """
     context = ssl.create_default_context()
     ca_file = os.getenv("MAX_CA_FILE", "").strip()
     if ca_file:
@@ -85,8 +214,6 @@ def max_headers() -> dict[str, str]:
 
 
 def main_keyboard() -> list[list[dict]]:
-    # MAX inline keyboard buttons of type "message" send their text as a
-    # normal message, so the existing message_created webhook handles them.
     return [
         [{"type": "message", "text": "Создать фото"},
          {"type": "message", "text": "Создать видео"}],
@@ -98,12 +225,7 @@ def main_keyboard() -> list[list[dict]]:
     ]
 
 
-async def send_max(
-    user_id: int,
-    text: str,
-    *,
-    with_menu: bool = False,
-) -> None:
+async def send_max(user_id: int, text: str, *, with_menu: bool = False) -> None:
     payload = {"text": text[:4000]}
     if with_menu:
         payload["attachments"] = [{
@@ -112,10 +234,7 @@ async def send_max(
         }]
 
     try:
-        async with httpx.AsyncClient(
-            timeout=20,
-            verify=max_ssl_context(),
-        ) as http:
+        async with httpx.AsyncClient(timeout=20, verify=max_ssl_context()) as http:
             response = await http.post(
                 f"{MAX_API}/messages",
                 params={"user_id": user_id},
@@ -136,19 +255,32 @@ async def send_max(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "NEUROPIX AI bridge"}
+    database_status = "not_configured"
+    if os.getenv("DATABASE_URL", "").strip():
+        try:
+            initialize_database()
+            with db_connect() as conn:
+                conn.execute("SELECT 1")
+            database_status = "connected"
+        except HTTPException:
+            database_status = "error"
+    return {
+        "ok": True,
+        "service": "NEUROPIX AI bridge",
+        "database": database_status,
+    }
 
 
 @app.post("/generate/image")
 async def generate_image(body: ImageRequest):
+    # Generation endpoint is retained, but the MAX chat flow does not call it yet.
     try:
         return await gen_client().create_image(
             prompt=body.prompt,
             aspect_ratio=body.aspect_ratio,
             resolution=body.resolution,
             output_format=body.output_format,
-            image_input=[str(x) for x in body.image_input]
-            if body.image_input else None,
+            image_input=[str(x) for x in body.image_input] if body.image_input else None,
         )
     except Gen202Error as exc:
         raise HTTPException(status_code=502, detail=str(exc))
@@ -163,10 +295,8 @@ async def generate_video(body: VideoRequest):
             aspect_ratio=body.aspect_ratio,
             resolution=body.resolution,
             generate_audio=body.generate_audio,
-            first_frame_url=str(body.first_frame_url)
-            if body.first_frame_url else None,
-            last_frame_url=str(body.last_frame_url)
-            if body.last_frame_url else None,
+            first_frame_url=str(body.first_frame_url) if body.first_frame_url else None,
+            last_frame_url=str(body.last_frame_url) if body.last_frame_url else None,
             reference_image_urls=[str(x) for x in body.reference_image_urls]
             if body.reference_image_urls else None,
             reference_video_urls=[str(x) for x in body.reference_video_urls]
@@ -198,8 +328,14 @@ async def max_webhook(
     update_type = update.get("update_type")
 
     if update_type == "bot_started":
-        user_id = (update.get("user") or {}).get("user_id")
+        user = update.get("user") or {}
+        user_id = user.get("user_id")
         if user_id:
+            save_user(
+                int(user_id),
+                user.get("username"),
+                user.get("first_name"),
+            )
             await send_max(
                 int(user_id),
                 "Добро пожаловать в NEUROPIX!\nВыбери, что хочешь создать:",
@@ -216,7 +352,16 @@ async def max_webhook(
     body = message.get("body") or {}
     message_text = (body.get("text") or message.get("text") or "").strip()
 
-    if not user_id or not message_text:
+    if not user_id:
+        return {"ok": True}
+
+    save_user(
+        int(user_id),
+        sender.get("username"),
+        sender.get("first_name"),
+    )
+
+    if not message_text:
         return {"ok": True}
 
     command = message_text.lower()
@@ -227,54 +372,57 @@ async def max_webhook(
     elif command in ("/help", "помощь"):
         answer = (
             "Выбери раздел кнопками ниже.\n"
-            "Пока меню работает в тестовом режиме: генерации, баланс и оплата "
-            "ещё не подключены."
+            "Генерация и оплата пока не включены."
         )
         show_menu = True
     elif command in ("создать фото", "фото"):
         answer = (
-            "Создание фото выбрано. Следующим этапом подключим загрузку "
-            "референса, ввод промпта и запуск Nano Banana 2.1. "
-            "Сейчас генерация отключена, кредиты не расходуются."
+            "Создание фото выбрано. Скоро подключим загрузку референса, "
+            "промпт и Nano Banana 2.1. Сейчас запуск отключён — кредиты не расходуются."
         )
         show_menu = True
     elif command in ("создать видео", "видео"):
         answer = (
-            "Создание видео выбрано. Следующим этапом подключим промпт, "
-            "референсы и параметры Seedance 2.5. "
-            "Сейчас генерация отключена, кредиты не расходуются."
+            "Создание видео выбрано. Скоро подключим промпт, референсы "
+            "и Seedance 2.5. Сейчас запуск отключён — кредиты не расходуются."
         )
         show_menu = True
     elif command == "каталог эффектов":
         answer = (
-            "Каталог эффектов подготовим отдельно: кинематографичный портрет, "
-            "смена образа, оживление фото, рекламный ролик и другие шаблоны. "
-            "Пока это демонстрационный раздел."
+            "Каталог эффектов готовится: кинематографичный портрет, смена образа, "
+            "оживление фото, рекламный ролик и другие шаблоны."
         )
         show_menu = True
     elif command == "мой баланс":
-        answer = "Баланс пока не подключён. Система учёта кредитов будет добавлена до запуска платных генераций."
+        balance = get_user_balance(int(user_id))
+        answer = f"Твой баланс: {balance} кредитов.\nПокупка и начисление кредитов пока не включены."
         show_menu = True
     elif command == "купить кредиты":
-        answer = "Покупка кредитов пока не подключена. Сначала настроим платёжный сервис и автоматическое начисление."
+        answer = (
+            "Покупка кредитов пока не подключена. Сначала настроим платёжный "
+            "сервис и безопасное автоматическое начисление."
+        )
         show_menu = True
     elif command == "история":
-        answer = "История генераций появится после подключения базы данных и самого процесса генерации."
+        history = get_user_history(int(user_id))
+        if not history:
+            answer = "История пока пустая. Здесь будут отображаться твои генерации."
+        else:
+            lines = [
+                f"• {item['generation_type']} — {item['status']} "
+                f"({item['created_at'].astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')})"
+                for item in history
+            ]
+            answer = "Последние операции:\n" + "\n".join(lines)
         show_menu = True
     elif command == "поддержка":
-        answer = "Раздел поддержки готовится. Здесь появится способ связаться с администратором."
+        answer = "По вопросам работы NEUROPIX напиши администратору: контакт поддержки будет добавлен перед запуском."
         show_menu = True
     elif command.startswith(("фото:", "image:")):
-        answer = (
-            "Запрос получил. Генерация пока отключена, поэтому кредиты не расходуются. "
-            "Скоро добавим полноценную форму создания фото."
-        )
+        answer = "Запрос принят, но генерация пока отключена. Кредиты не расходуются."
         show_menu = True
     elif command.startswith(("видео:", "video:")):
-        answer = (
-            "Запрос получил. Генерация пока отключена, поэтому кредиты не расходуются. "
-            "Скоро добавим полноценную форму создания видео."
-        )
+        answer = "Запрос принят, но генерация пока отключена. Кредиты не расходуются."
         show_menu = True
     else:
         answer = "Не понял команду. Выбери раздел кнопками меню ниже."
@@ -285,18 +433,13 @@ async def max_webhook(
 
 
 @app.post("/max/register-webhook")
-async def register_webhook(
-    x_admin_secret: str | None = Header(default=None),
-):
+async def register_webhook(x_admin_secret: str | None = Header(default=None)):
     if x_admin_secret != required_env("MAX_ADMIN_SECRET"):
         raise HTTPException(status_code=401, detail="Invalid admin secret")
 
     webhook_url = required_env("MAX_WEBHOOK_URL")
     if not webhook_url.startswith("https://"):
-        raise HTTPException(
-            status_code=500,
-            detail="MAX_WEBHOOK_URL must use HTTPS",
-        )
+        raise HTTPException(status_code=500, detail="MAX_WEBHOOK_URL must use HTTPS")
 
     payload = {
         "url": webhook_url,
@@ -305,10 +448,7 @@ async def register_webhook(
     }
 
     try:
-        async with httpx.AsyncClient(
-            timeout=20,
-            verify=max_ssl_context(),
-        ) as http:
+        async with httpx.AsyncClient(timeout=20, verify=max_ssl_context()) as http:
             response = await http.post(
                 f"{MAX_API}/subscriptions",
                 headers=max_headers(),
@@ -330,10 +470,7 @@ async def register_webhook(
     ):
         raise HTTPException(
             status_code=502,
-            detail={
-                "status": response.status_code,
-                "response": data,
-            },
+            detail={"status": response.status_code, "response": data},
         )
 
     return {"ok": True, "response": data}
