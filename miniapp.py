@@ -125,6 +125,7 @@ async def miniapp_auth(body: AuthBody):
         "balance": int(row["balance"]) if row else 0,
         "generation_enabled": os.getenv("ENABLE_PAID_GENERATION", "false").lower() in ("1", "true", "yes", "on"),
         "payments_configured": bool(os.getenv("YOOKASSA_SHOP_ID") and os.getenv("YOOKASSA_SECRET_KEY")),
+        "payments_enabled": os.getenv("ENABLE_PAYMENTS", "false").strip().lower() in ("1", "true", "yes", "on"),
     }
 
 
@@ -196,6 +197,8 @@ async def miniapp_generate(body: GenerateBody, authorization: str | None = Heade
 @router.post("/miniapp/api/payment")
 async def miniapp_payment(body: PaymentBody, authorization: str | None = Header(default=None)):
     user_id = _current_user(authorization)
+    if os.getenv("ENABLE_PAYMENTS", "false").strip().lower() not in ("1", "true", "yes", "on"):
+        raise HTTPException(status_code=503, detail="Приём платежей пока выключен до проверки кассовых и налоговых настроек.")
     if body.credits not in (100, 300, 500, 1000):
         raise HTTPException(status_code=400, detail="Неизвестный пакет")
     from main import create_pending_purchase_order, required_env
