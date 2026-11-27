@@ -723,7 +723,7 @@ async def refresh_generation(user_id: int, row):
                 UPDATE generation_history SET status='completed', result_url=%s, completed_at=NOW()
                 WHERE id=%s AND max_user_id=%s
             """, (urls[0], generation_id, user_id))
-        return "Готово! Ссылка на результат:\\n" + "\\n".join(urls[:4])
+        return "Готово! Ссылка на результат:\n" + "\n".join(urls[:4])
     if state in ("fail", "failed", "error"):
         reason = str(status.get("fail_message") or status.get("fail_code") or "Ошибка GEN202")
         refunded = refund_generation(user_id, generation_id, f"Ошибка GEN202: {reason}")
@@ -769,7 +769,7 @@ async def generation_poll_worker():
                     """, (generation_id,)).fetchone()
                 if completed:
                     if completed["status"] == "completed":
-                        message = f"Генерация №{generation_id} готова!\\nРезультат: {completed['result_url']}"
+                        message = f"Генерация №{generation_id} готова!\nРезультат: {completed['result_url']}"
                     else:
                         message = f"Генерация №{generation_id} не удалась. Кредиты возвращены. {(completed['last_error'] or '')[:500]}"
                     await send_max(user_id, message, with_menu=True)
